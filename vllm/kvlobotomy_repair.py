@@ -313,35 +313,56 @@ def selective_recompute_with_tokens(worker, new_seq_len, block_table,
         val_cache[rep_blk, rep_off] = v
 
         # Attention: repair Q against full cached K, V
+        # Process in chunks to avoid OOM. Use KV heads directly with GQA grouping.
         all_k = key_cache[all_blk, all_off]  # [seq_len, kv_heads, head_dim]
         all_v = val_cache[all_blk, all_off]
 
-        # GQA: expand kv heads to match q heads
         gqa_ratio = num_q_heads // num_kv_heads
-        if gqa_ratio > 1:
-            all_k = all_k.unsqueeze(2).expand(-1, -1, gqa_ratio, -1).reshape(
-                new_seq_len, num_q_heads, head_dim)
-            all_v = all_v.unsqueeze(2).expand(-1, -1, gqa_ratio, -1).reshape(
-                new_seq_len, num_q_heads, head_dim)
+        scale = head_dim ** -0.5
+        attn_out_list = []
 
-        # Compute attention: [num_repair, num_q_heads, head_dim] @ [seq_len, num_q_heads, head_dim]
-        # Use scaled_dot_product_attention with causal masking
-        # Reshape for SDPA: [batch=num_q_heads, seq=num_repair, dim=head_dim]
-        q_t = q.transpose(0, 1)  # [num_q_heads, num_repair, head_dim]
-        k_t = all_k.transpose(0, 1)  # [num_q_heads, seq_len, head_dim]
-        v_t = all_v.transpose(0, 1)
+        REPAIR_CHUNK = 64  # Process repair tokens in chunks
+        for rc_start in range(0, num_repair, REPAIR_CHUNK):
+            rc_end = min(rc_start + REPAIR_CHUNK, num_repair)
+            q_chunk = q[rc_start:rc_end]  # [chunk, num_q_heads, head_dim]
+            chunk_len = rc_end - rc_start
 
-        # Custom causal mask: each repair token at position p attends to [0, p]
-        attn_mask = torch.zeros(num_repair, new_seq_len, device=device, dtype=q.dtype)
-        for i, pos in enumerate(repair_global):
-            attn_mask[i, pos + 1:] = float('-inf')
+            # Per KV-head group attention
+            head_outputs = []
+            for kv_h in range(num_kv_heads):
+                # Q heads for this KV head group
+                q_h = q_chunk[:, kv_h * gqa_ratio:(kv_h + 1) * gqa_ratio, :]
+                # [chunk, gqa_ratio, head_dim]
+                k_h = all_k[:, kv_h, :]  # [seq_len, head_dim]
+                v_h = all_v[:, kv_h, :]  # [seq_len, head_dim]
 
-        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
-            attn_out = F.scaled_dot_product_attention(
-                q_t, k_t, v_t, attn_mask=attn_mask.unsqueeze(0),
-            )  # [num_q_heads, num_repair, head_dim]
+                # Attention scores: [chunk, gqa_ratio, seq_len]
+                scores = torch.bmm(
+                    q_h,  # [chunk, gqa_ratio, head_dim]
+                    k_h.unsqueeze(0).expand(chunk_len, -1, -1).transpose(1, 2),
+                ) * scale
 
-        attn_out = attn_out.transpose(0, 1).reshape(num_repair, -1)
+                # Causal mask
+                for i in range(chunk_len):
+                    pos = repair_global[rc_start + i]
+                    scores[i, :, pos + 1:] = float('-inf')
+
+                weights = F.softmax(scores, dim=-1)  # [chunk, gqa_ratio, seq_len]
+
+                # Weighted sum of values
+                # [chunk, gqa_ratio, head_dim]
+                out = torch.bmm(
+                    weights,
+                    v_h.unsqueeze(0).expand(chunk_len, -1, -1),
+                )
+                head_outputs.append(out)
+
+            # Concatenate all head groups: [chunk, num_q_heads, head_dim]
+            chunk_out = torch.cat(head_outputs, dim=1)
+            attn_out_list.append(chunk_out)
+
+        attn_out = torch.cat(attn_out_list, dim=0)  # [num_repair, num_q_heads, head_dim]
+        attn_out = attn_out.reshape(num_repair, -1)
         # [num_repair, num_q_heads * head_dim]
 
         # Output projection
