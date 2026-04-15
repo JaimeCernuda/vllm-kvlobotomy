@@ -382,3 +382,222 @@ def selective_recompute_with_tokens(worker, new_seq_len, block_table,
         "num_total": new_seq_len,
         "repair_ratio": num_repair / max(1, new_seq_len - delete_start),
     }
+
+
+def fast_selective_recompute(worker, new_seq_len, block_table,
+                             repair_indices, head_dim, delete_start,
+                             ac_token_ids):
+    """Selectively recompute KV for repair tokens using FlashAttention.
+
+    Instead of manual torch.bmm per-head per-chunk attention, this runs
+    repair tokens through vLLM's actual model layers and uses
+    flash_attn_varlen_func with the paged KV cache for attention.
+
+    Causal masking strategy: each repair token is treated as a separate
+    "sequence" in the varlen batch (query_len=1, kv_len=position+1).
+    This gives correct per-token causal masking even though repair tokens
+    are at scattered positions in the sequence.
+
+    Pipeline per layer:
+      1. input_layernorm(hidden, residual)
+      2. QKV projection
+      3. RoPE on Q and K
+      4. Write fresh K, V into paged KV cache at repair positions
+      5. FlashAttention: each repair query attends to its causal context
+      6. Output projection
+      7. post_attention_layernorm + MLP
+
+    Args:
+        worker: vLLM GPU worker
+        new_seq_len: total tokens in AC sequence (after B removal)
+        block_table: physical block table (list of ints)
+        repair_indices: C-relative indices to repair (0-based within C)
+        head_dim: attention head dimension
+        delete_start: where C starts in AC sequence
+        ac_token_ids: full AC token ID sequence (for embedding lookup)
+
+    Returns:
+        dict with repair timing and counts
+    """
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    # ------------------------------------------------------------------
+    # 1. Extract model components
+    # ------------------------------------------------------------------
+    model_runner = worker.model_runner
+    model_obj = model_runner.model
+    llama_model = model_obj.model  # LlamaModel
+
+    # KV cache: list of tensors, one per layer
+    # Each tensor shape: [2, num_blocks, block_size, num_kv_heads, head_dim]
+    kv_caches = model_runner.kv_caches
+    assert len(kv_caches) > 0, "No KV caches bound to model_runner"
+
+    # Inspect cache shape
+    first_cache = kv_caches[0]
+    assert first_cache.dim() == 5, (
+        f"Expected KV cache shape [2, num_blocks, block_size, kv_heads, head_dim], "
+        f"got {first_cache.shape}"
+    )
+    _, num_blocks, block_size, num_kv_heads, cache_head_dim = first_cache.shape
+    assert cache_head_dim == head_dim, (
+        f"head_dim mismatch: expected {head_dim}, cache has {cache_head_dim}"
+    )
+
+    device = first_cache.device
+    num_layers = len(kv_caches)
+    num_q_heads = llama_model.layers[0].self_attn.num_heads
+
+    num_repair = len(repair_indices)
+    assert num_repair > 0, "No repair indices provided"
+
+    # ------------------------------------------------------------------
+    # 2. Compute positions and slot mappings
+    # ------------------------------------------------------------------
+    # Global positions in the AC sequence for repair tokens
+    repair_global = torch.tensor(
+        [delete_start + i for i in repair_indices],
+        device=device, dtype=torch.long,
+    )
+
+    # Block table on GPU
+    bt_t = torch.tensor(block_table, device=device, dtype=torch.long)
+
+    # slot_mapping for reshape_and_cache_flash:
+    # slot = physical_block * block_size + offset_within_block
+    rep_logical_blocks = repair_global // block_size
+    rep_offsets = repair_global % block_size
+    rep_physical_blocks = bt_t[rep_logical_blocks]
+    slot_mapping = rep_physical_blocks * block_size + rep_offsets
+
+    # ------------------------------------------------------------------
+    # 3. Get token embeddings
+    # ------------------------------------------------------------------
+    repair_token_ids = torch.tensor(
+        [ac_token_ids[delete_start + i] for i in repair_indices],
+        device=device, dtype=torch.long,
+    )
+    hidden_states = llama_model.embed_tokens(repair_token_ids)
+    # hidden_states: [num_repair, hidden_size]
+
+    # ------------------------------------------------------------------
+    # 4. Prepare FlashAttention metadata
+    # ------------------------------------------------------------------
+    # Each repair token is a separate "sequence" in the varlen batch.
+    # This ensures correct causal masking: repair token i at position p_i
+    # attends to keys [0..p_i] (seqused_k = p_i + 1).
+    #
+    # cu_seqlens_q = [0, 1, 2, ..., num_repair]  (each sequence has 1 query)
+    # seqused_k[i] = repair_global[i] + 1        (causal: attend up to own pos)
+    # block_table: [num_repair, max_logical_blocks] (all rows identical)
+    cu_seqlens_q = torch.arange(
+        num_repair + 1, device=device, dtype=torch.int32
+    )
+    seqused_k = (repair_global + 1).to(torch.int32)
+
+    # Block table for FlashAttention: [batch=num_repair, max_logical_blocks]
+    # All repair tokens share the same paged KV layout, so all rows are identical.
+    num_logical_blocks = (new_seq_len + block_size - 1) // block_size
+    fa_block_row = bt_t[:num_logical_blocks].to(torch.int32)
+    fa_block_table = fa_block_row.unsqueeze(0).expand(num_repair, -1).contiguous()
+
+    max_seqlen_k = int(seqused_k.max().item())
+
+    # FlashAttention scale
+    scale = head_dim ** -0.5
+
+    # Detect FA version for this platform
+    from vllm.v1.attention.backends.fa_utils import (
+        flash_attn_varlen_func,
+        get_flash_attn_version,
+        reshape_and_cache_flash,
+    )
+    fa_version = get_flash_attn_version()
+    assert fa_version is not None, "FlashAttention not available on this platform"
+
+    # Pre-allocate scale tensors (reused across layers)
+    k_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    v_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+
+    # ------------------------------------------------------------------
+    # 5. Layer-by-layer forward pass
+    # ------------------------------------------------------------------
+    residual = None
+
+    for layer_idx in range(num_layers):
+        layer = llama_model.layers[layer_idx]
+        kv_cache = kv_caches[layer_idx]
+        key_cache, value_cache = kv_cache.unbind(0)
+        # key_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+        # value_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+
+        # 5a. Input LayerNorm
+        if residual is None:
+            residual = hidden_states
+            hidden_states = layer.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = layer.input_layernorm(
+                hidden_states, residual)
+
+        # 5b. QKV projection
+        qkv, _ = layer.self_attn.qkv_proj(hidden_states)
+        q_size = layer.self_attn.q_size
+        kv_size = layer.self_attn.kv_size
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+        # 5c. RoPE rotation using the model's rotary_emb
+        q, k = layer.self_attn.rotary_emb(repair_global, q, k)
+
+        # 5d. Reshape for FlashAttention
+        q = q.view(num_repair, num_q_heads, head_dim)
+        k = k.view(num_repair, num_kv_heads, head_dim)
+        v = v.view(num_repair, num_kv_heads, head_dim)
+
+        # 5e. Write fresh K, V to paged cache at repair positions
+        reshape_and_cache_flash(
+            k, v, key_cache, value_cache, slot_mapping,
+            kv_cache_dtype="auto", k_scale=k_scale, v_scale=v_scale,
+        )
+
+        # 5f. FlashAttention: each repair query attends to its causal KV
+        # Each repair token is batch element i with query_len=1 and
+        # kv_len=repair_global[i]+1. FlashAttention reads K,V from
+        # the paged cache via block_table.
+        attn_output = torch.empty(
+            num_repair, num_q_heads, head_dim,
+            dtype=q.dtype, device=device,
+        )
+        flash_attn_varlen_func(
+            q=q,
+            k=key_cache,
+            v=value_cache,
+            out=attn_output,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=1,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=scale,
+            causal=True,
+            block_table=fa_block_table,
+            fa_version=fa_version,
+        )
+
+        # 5g. Output projection
+        attn_output = attn_output.view(num_repair, -1)
+        hidden_states, _ = layer.self_attn.o_proj(attn_output)
+
+        # 5h. Post-attention LayerNorm + MLP
+        hidden_states, residual = layer.post_attention_layernorm(
+            hidden_states, residual)
+        hidden_states = layer.mlp(hidden_states)
+
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+
+    return {
+        "repair_time_ms": (t1 - t0) * 1000.0,
+        "num_repaired": num_repair,
+        "num_total": new_seq_len,
+        "repair_ratio": num_repair / max(1, new_seq_len - delete_start),
+    }
