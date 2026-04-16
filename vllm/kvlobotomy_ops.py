@@ -26,6 +26,8 @@ def apply_delta_rotation(
     delta: int,
     head_dim: int,
     rope_theta: float = 500000.0,
+    rope_start: int = 0,
+    rope_dim: int = None,
 ) -> torch.Tensor:
     """Apply a delta RoPE rotation to key vectors.
 
@@ -39,6 +41,13 @@ def apply_delta_rotation(
         delta: position shift (typically negative, e.g., -len(B))
         head_dim: dimension of each attention head
         rope_theta: RoPE base frequency
+        rope_start: offset into the last dim at which the rotated portion
+                    begins. 0 for standard LLaMA/Mistral/etc. Non-zero for
+                    MLA (DeepSeek-V2/V3), where only [kv_lora_rank:kv_lora_rank
+                    + qk_rope_head_dim] has RoPE applied.
+        rope_dim: number of dims actually rotated, starting at rope_start.
+                  None means "use head_dim" (standard models). For MLA this is
+                  qk_rope_head_dim (typically 64).
     Returns:
         Corrected keys tensor [N, num_kv_heads, head_dim]
     """
@@ -46,24 +55,32 @@ def apply_delta_rotation(
     dtype = keys.dtype
     num_tokens, num_heads, d = keys.shape
 
-    # Compute rotation frequencies
-    freq_indices = torch.arange(0, d // 2, device=device, dtype=torch.float32)
-    freqs = 1.0 / (rope_theta ** (2.0 * freq_indices / d))
+    if rope_dim is None:
+        rope_dim = head_dim
+
+    # Compute rotation frequencies over the rotated slice (not the full d)
+    freq_indices = torch.arange(0, rope_dim // 2, device=device, dtype=torch.float32)
+    freqs = 1.0 / (rope_theta ** (2.0 * freq_indices / rope_dim))
 
     # Delta angles
-    angles = delta * freqs  # [d//2]
-    cos_delta = torch.cos(angles).to(dtype)  # [d//2]
-    sin_delta = torch.sin(angles).to(dtype)  # [d//2]
+    angles = delta * freqs  # [rope_dim//2]
+    cos_delta = torch.cos(angles).to(dtype)
+    sin_delta = torch.sin(angles).to(dtype)
 
-    # Split keys into pairs for rotation (neox style: first half, second half)
-    k_even = keys[..., : d // 2]  # [N, H, d//2]
-    k_odd = keys[..., d // 2 :]  # [N, H, d//2]
-
-    # Apply 2D rotation to each pair
+    # Slice out the rope portion; leave the rope-free prefix (MLA latent) alone
+    k_rope = keys[..., rope_start:rope_start + rope_dim]  # [N, H, rope_dim]
+    k_even = k_rope[..., : rope_dim // 2]
+    k_odd = k_rope[..., rope_dim // 2 :]
     new_even = k_even * cos_delta - k_odd * sin_delta
     new_odd = k_even * sin_delta + k_odd * cos_delta
+    rotated_rope = torch.cat([new_even, new_odd], dim=-1)
 
-    return torch.cat([new_even, new_odd], dim=-1)
+    # Stitch back if partial rope
+    if rope_start == 0 and rope_dim == d:
+        return rotated_rope
+    out = keys.clone()
+    out[..., rope_start:rope_start + rope_dim] = rotated_rope
+    return out
 
 
 def apply_rope_rotation(
@@ -353,4 +370,106 @@ def kvlobotomy_full_delete(worker, delete_start, delete_end, rope_storage,
         "rope_storage": rope_storage,
         "delete_start": delete_start,
         "delete_end": delete_end,
+    }
+
+
+# ---------------------------------------------------------------------------
+# KV cache snapshots (for L2 analysis and visualizer)
+# ---------------------------------------------------------------------------
+
+def install_block_capture_hook(worker):
+    """Install hook on worker to capture block table after each forward pass.
+
+    The block table maps logical block indices to physical block IDs in the
+    KV cache tensor. It's needed by snapshot_kv_cache to read the correct
+    physical locations.
+
+    The hook patches execute_model to save the block table from the input
+    batch after every forward pass. The last captured table is used by
+    snapshot_kv_cache.
+
+    Args:
+        worker: vLLM GPU worker (passed by collective_rpc).
+
+    Returns:
+        dict with status.
+    """
+    _original_execute = worker.execute_model
+
+    def _hooked_execute(scheduler_output):
+        result = _original_execute(scheduler_output)
+        # Capture block table for group 0 (standard attention), request 0
+        bt = worker.model_runner.input_batch.block_table[0]
+        worker._kvlobotomy_block_table = bt.block_table.np[0].copy()
+        return result
+
+    worker.execute_model = _hooked_execute
+    return {"status": "hook_installed"}
+
+
+def snapshot_kv_cache(worker, num_tokens, save_path, metadata):
+    """Snapshot the KV cache for the first num_tokens positions.
+
+    Reads key and value tensors from each layer's KV cache using the
+    block table captured by install_block_capture_hook. Saves to a .pt
+    file compatible with the KV cache visualizer.
+
+    Output format:
+        {
+            "metadata": {...},
+            "layer_0": {"keys": [N, H, D], "values": [N, H, D]},
+            "layer_1": ...,
+        }
+
+    Args:
+        worker: vLLM GPU worker (passed by collective_rpc).
+        num_tokens: Number of token positions to snapshot (from position 0).
+        save_path: Path to save the .pt file.
+        metadata: Dict of metadata to include in the snapshot.
+
+    Returns:
+        dict with status, path, num_tokens, num_layers.
+    """
+    assert hasattr(worker, '_kvlobotomy_block_table'), (
+        "No block table captured. Call install_block_capture_hook first "
+        "and run at least one forward pass."
+    )
+
+    block_ids = worker._kvlobotomy_block_table
+    kv_caches = worker.model_runner.kv_caches
+    assert len(kv_caches) > 0, "No KV caches found on worker"
+
+    block_size = kv_caches[0][0].shape[1]
+    num_blocks_needed = (num_tokens + block_size - 1) // block_size
+
+    snapshot = {"metadata": metadata}
+
+    for layer_idx, kv_cache in enumerate(kv_caches):
+        key_cache = kv_cache[0]  # [num_blocks, block_size, kv_heads, head_dim]
+        val_cache = kv_cache[1]
+
+        keys_list = []
+        vals_list = []
+        tokens_read = 0
+
+        for b in range(num_blocks_needed):
+            if tokens_read >= num_tokens:
+                break
+            phys_block = int(block_ids[b])
+            remaining = min(block_size, num_tokens - tokens_read)
+            keys_list.append(key_cache[phys_block, :remaining].cpu())
+            vals_list.append(val_cache[phys_block, :remaining].cpu())
+            tokens_read += remaining
+
+        snapshot[f"layer_{layer_idx}"] = {
+            "keys": torch.cat(keys_list, dim=0),
+            "values": torch.cat(vals_list, dim=0),
+        }
+
+    torch.save(snapshot, save_path)
+    return {
+        "status": "saved",
+        "path": save_path,
+        "num_tokens": num_tokens,
+        "num_layers": len(kv_caches),
     }
