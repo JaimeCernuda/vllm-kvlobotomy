@@ -235,18 +235,14 @@ def _prefill_b_prime(worker, b_prime_token_ids, insert_pos, a_len,
     head_dim = kv_caches[0][0].shape[3]
     num_q_heads = llama_model.layers[0].self_attn.num_heads
 
-    # fast_insert reruns a pre-norm layer forward: input_layernorm -> qkv_proj -> ...
-    # OLMo-2 and similar post-norm architectures lack `input_layernorm` entirely,
-    # so our forward path breaks. Detect early and emit a clear, actionable error
-    # rather than crashing on AttributeError deep inside a for-loop.
+    # Detect pre-norm (LLaMA-style) vs post-norm (OLMo-2-style) architectures.
+    # Pre-norm: input_layernorm -> qkv_proj -> attention -> o_proj -> residual +
+    #           post_attention_layernorm -> mlp -> residual +.
+    # Post-norm: qkv_proj -> attention -> o_proj -> post_attention_layernorm ->
+    #            residual + -> mlp -> post_feedforward_layernorm -> residual +.
     _first_layer = llama_model.layers[0]
-    if not hasattr(_first_layer, 'input_layernorm'):
-        raise NotImplementedError(
-            f'fast_insert requires a pre-norm decoder layer with input_layernorm. '
-            f'Model layer is {type(_first_layer).__name__} (post-norm?). Supporting '
-            f'post-norm architectures (OLMo-2, ...) requires an alternative forward '
-            f'path — tracked as follow-up work.'
-        )
+    _is_post_norm = (not hasattr(_first_layer, 'input_layernorm')
+                     and hasattr(_first_layer, 'post_feedforward_layernorm'))
 
     rotary_emb = llama_model.layers[0].self_attn.rotary_emb
     cos_sin_cache = _get_rotary_cos_sin_cache(rotary_emb)
@@ -295,19 +291,29 @@ def _prefill_b_prime(worker, b_prime_token_ids, insert_pos, a_len,
         key_cache = kv_caches[layer_idx][0]
         val_cache = kv_caches[layer_idx][1]
 
-        # LayerNorm
-        if residual is None:
-            residual = hidden_states
-            hidden_states = layer.input_layernorm(hidden_states)
+        # Pre-attention layernorm (pre-norm only). For post-norm, the
+        # attention block is computed from the raw residual stream and the
+        # layernorm is applied AFTER attention.
+        if _is_post_norm:
+            residual_pre_attn = hidden_states
+            attn_input = hidden_states
         else:
-            hidden_states, residual = layer.input_layernorm(
-                hidden_states, residual)
+            if residual is None:
+                residual = hidden_states
+                attn_input = layer.input_layernorm(hidden_states)
+            else:
+                attn_input, residual = layer.input_layernorm(
+                    hidden_states, residual)
 
         # QKV projection
-        qkv, _ = layer.self_attn.qkv_proj(hidden_states)
+        qkv, _ = layer.self_attn.qkv_proj(attn_input)
         q_size = layer.self_attn.q_size
         kv_size = layer.self_attn.kv_size
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+        # Some architectures (OLMo-2) apply q/k RMSNorm before RoPE.
+        if hasattr(layer.self_attn, '_apply_qk_norm'):
+            q, k = layer.self_attn._apply_qk_norm(q, k)
 
         # Reshape
         q = q.view(b_prime_len, num_q_heads, head_dim)
@@ -363,12 +369,23 @@ def _prefill_b_prime(worker, b_prime_token_ids, insert_pos, a_len,
         attn_out = attn_out.reshape(b_prime_len, -1)
 
         # Output projection
-        hidden_states, _ = layer.self_attn.o_proj(attn_out)
+        attn_proj, _ = layer.self_attn.o_proj(attn_out)
 
-        # Post-attention layernorm + MLP
-        hidden_states, residual = layer.post_attention_layernorm(
-            hidden_states, residual)
-        hidden_states = layer.mlp(hidden_states)
+        if _is_post_norm:
+            # OLMo-2 post-norm: residual + post_attention_layernorm(attn_out)
+            attn_normed = layer.post_attention_layernorm(attn_proj)
+            hidden_states = residual_pre_attn + attn_normed
+            residual_pre_mlp = hidden_states
+            mlp_out = layer.mlp(hidden_states)
+            mlp_normed = layer.post_feedforward_layernorm(mlp_out)
+            hidden_states = residual_pre_mlp + mlp_normed
+        else:
+            hidden_states = attn_proj
+            # Pre-norm: layer.post_attention_layernorm updates residual and
+            # normalizes hidden_states in one call
+            hidden_states, residual = layer.post_attention_layernorm(
+                hidden_states, residual)
+            hidden_states = layer.mlp(hidden_states)
 
     return {"b_prime_len": b_prime_len}
 
@@ -1088,11 +1105,8 @@ def _prefill_independent_contiguous(worker, token_ids, head_dim):
     n_tokens = len(token_ids)
 
     _first_layer = llama_model.layers[0]
-    if not hasattr(_first_layer, 'input_layernorm'):
-        raise NotImplementedError(
-            f'_prefill_independent_contiguous requires pre-norm decoder layer. '
-            f'Got {type(_first_layer).__name__} (post-norm?). Not supported yet.'
-        )
+    _is_post_norm = (not hasattr(_first_layer, 'input_layernorm')
+                     and hasattr(_first_layer, 'post_feedforward_layernorm'))
 
     fa_version = get_flash_attn_version()
     assert fa_version is not None, "FlashAttention not available"
@@ -1117,19 +1131,26 @@ def _prefill_independent_contiguous(worker, token_ids, head_dim):
     for layer_idx in range(num_layers):
         layer = llama_model.layers[layer_idx]
 
-        # LayerNorm
-        if residual is None:
-            residual = hidden_states
-            hidden_states = layer.input_layernorm(hidden_states)
+        if _is_post_norm:
+            residual_pre_attn = hidden_states
+            attn_input = hidden_states
         else:
-            hidden_states, residual = layer.input_layernorm(
-                hidden_states, residual)
+            if residual is None:
+                residual = hidden_states
+                attn_input = layer.input_layernorm(hidden_states)
+            else:
+                attn_input, residual = layer.input_layernorm(
+                    hidden_states, residual)
 
         # QKV projection
-        qkv, _ = layer.self_attn.qkv_proj(hidden_states)
+        qkv, _ = layer.self_attn.qkv_proj(attn_input)
         q_size = layer.self_attn.q_size
         kv_size = layer.self_attn.kv_size
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+        # OLMo-2 qk_norm (pre-RoPE)
+        if hasattr(layer.self_attn, '_apply_qk_norm'):
+            q, k = layer.self_attn._apply_qk_norm(q, k)
 
         # RoPE at independent positions [0, n_tokens)
         q, k = layer.self_attn.rotary_emb(positions, q, k)
@@ -1162,12 +1183,20 @@ def _prefill_independent_contiguous(worker, token_ids, head_dim):
 
         # Output projection
         attn_output = attn_output.view(n_tokens, -1)
-        hidden_states, _ = layer.self_attn.o_proj(attn_output)
+        attn_proj, _ = layer.self_attn.o_proj(attn_output)
 
-        # MLP
-        hidden_states, residual = layer.post_attention_layernorm(
-            hidden_states, residual)
-        hidden_states = layer.mlp(hidden_states)
+        if _is_post_norm:
+            attn_normed = layer.post_attention_layernorm(attn_proj)
+            hidden_states = residual_pre_attn + attn_normed
+            residual_pre_mlp = hidden_states
+            mlp_out = layer.mlp(hidden_states)
+            mlp_normed = layer.post_feedforward_layernorm(mlp_out)
+            hidden_states = residual_pre_mlp + mlp_normed
+        else:
+            hidden_states = attn_proj
+            hidden_states, residual = layer.post_attention_layernorm(
+                hidden_states, residual)
+            hidden_states = layer.mlp(hidden_states)
 
     return all_keys, all_values
 
