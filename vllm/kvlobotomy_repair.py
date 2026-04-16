@@ -506,6 +506,17 @@ def fast_compose_recompute(worker, new_seq_len, block_table,
             elif selection == 'last':
                 # Repair the last tokens only (attention-sink-like baseline)
                 top_indices = torch.arange(n_tokens - n_repair, n_tokens, device=device, dtype=torch.long)
+            elif selection == 'hybrid':
+                # Half budget to last tokens, half to top K-deviation over remaining.
+                n_last = n_repair // 2
+                last_idx = torch.arange(n_tokens - n_last, n_tokens, device=device, dtype=torch.long)
+                old_k = key_cache[all_physical, all_offsets]
+                k_dev = (k.float() - old_k.float()).pow(2).sum(dim=[1, 2])
+                # Mask out last-N so kdev doesn't double-pick them
+                k_dev[last_idx] = float('-inf')
+                n_kdev = n_repair - n_last
+                kdev_idx = k_dev.topk(n_kdev).indices
+                top_indices = torch.cat([last_idx, kdev_idx]).sort().values
             else:
                 raise ValueError(f'unknown selection: {selection}')
             repair_set = set(top_indices.tolist())
