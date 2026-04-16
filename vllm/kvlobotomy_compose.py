@@ -23,6 +23,34 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
+# Compatibility: retrieve the cos/sin cache from different rotary_emb variants
+# ---------------------------------------------------------------------------
+
+def _get_rotary_cos_sin_cache(rotary_emb):
+    """Return the cos/sin cache tensor across vLLM rotary_emb variants.
+
+    - Standard RotaryEmbedding: .cos_sin_cache
+    - Phi3LongRoPEScaledRotaryEmbedding: .long_short_cos_sin_cache.
+      If `use_long_rope=True`, the long rows are at indices [orig, orig+max_pos).
+      We return a *view* into those rows so positional indexing (cache[pos])
+      still works without a per-call shift.
+    """
+    if hasattr(rotary_emb, 'cos_sin_cache'):
+        return rotary_emb.cos_sin_cache
+    if hasattr(rotary_emb, 'long_short_cos_sin_cache'):
+        full = rotary_emb.long_short_cos_sin_cache
+        if getattr(rotary_emb, 'use_long_rope', False):
+            orig = rotary_emb.original_max_position_embeddings
+            return full[orig:]  # long-rope portion, indexable by absolute position
+        return full  # short-rope portion starts at row 0
+    raise AttributeError(
+        f'Rotary embedding {type(rotary_emb).__name__} lacks cos_sin_cache '
+        f'and long_short_cos_sin_cache — cross-architecture support may need '
+        f'extension for this model family'
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helper: RoPE correction using vLLM's precomputed cos/sin cache
 # ---------------------------------------------------------------------------
 
@@ -208,7 +236,7 @@ def _prefill_b_prime(worker, b_prime_token_ids, insert_pos, a_len,
     num_q_heads = llama_model.layers[0].self_attn.num_heads
 
     rotary_emb = llama_model.layers[0].self_attn.rotary_emb
-    cos_sin_cache = rotary_emb.cos_sin_cache
+    cos_sin_cache = _get_rotary_cos_sin_cache(rotary_emb)
     is_neox = rotary_emb.is_neox_style
 
     b_prime_len = len(b_prime_token_ids)
@@ -390,7 +418,7 @@ def smart_insert(worker, ac_seq_len, block_table, b_prime_token_ids,
     # Get rotary embedding's cos_sin_cache
     llama_model = worker.model_runner.model.model
     rotary_emb = llama_model.layers[0].self_attn.rotary_emb
-    cos_sin_cache = rotary_emb.cos_sin_cache
+    cos_sin_cache = _get_rotary_cos_sin_cache(rotary_emb)
     is_neox = rotary_emb.is_neox_style
 
     # --- Step 1: Extract C's KV from cache ---
@@ -539,7 +567,7 @@ def smart_replace(worker, total_seq_len, block_table, b_prime_token_ids,
 
     llama_model = worker.model_runner.model.model
     rotary_emb = llama_model.layers[0].self_attn.rotary_emb
-    cos_sin_cache = rotary_emb.cos_sin_cache
+    cos_sin_cache = _get_rotary_cos_sin_cache(rotary_emb)
     is_neox = rotary_emb.is_neox_style
 
     # Validate block table
@@ -908,7 +936,7 @@ def fast_insert_v1(worker, ac_seq_len, block_table, b_prime_token_ids,
 
     llama_model = worker.model_runner.model.model
     rotary_emb = llama_model.layers[0].self_attn.rotary_emb
-    cos_sin_cache = rotary_emb.cos_sin_cache
+    cos_sin_cache = _get_rotary_cos_sin_cache(rotary_emb)
     is_neox = rotary_emb.is_neox_style
 
     timings = {}
@@ -1179,7 +1207,7 @@ def fast_insert(worker, ac_seq_len, block_table, b_prime_token_ids,
 
     llama_model = worker.model_runner.model.model
     rotary_emb = llama_model.layers[0].self_attn.rotary_emb
-    cos_sin_cache = rotary_emb.cos_sin_cache
+    cos_sin_cache = _get_rotary_cos_sin_cache(rotary_emb)
     is_neox = rotary_emb.is_neox_style
 
     timings = {}
