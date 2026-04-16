@@ -802,26 +802,37 @@ def fast_selective_recompute(worker, new_seq_len, block_table,
     # ------------------------------------------------------------------
     residual = None
 
+    # Detect pre-norm vs post-norm (OLMo-2-style) at the top of the loop
+    _first_layer = llama_model.layers[0]
+    _is_post_norm = (not hasattr(_first_layer, 'input_layernorm')
+                     and hasattr(_first_layer, 'post_feedforward_layernorm'))
+
     for layer_idx in range(num_layers):
         layer = llama_model.layers[layer_idx]
         kv_cache = kv_caches[layer_idx]
         key_cache, value_cache = kv_cache.unbind(0)
-        # key_cache: [num_blocks, block_size, num_kv_heads, head_dim]
-        # value_cache: [num_blocks, block_size, num_kv_heads, head_dim]
 
-        # 5a. Input LayerNorm
-        if residual is None:
-            residual = hidden_states
-            hidden_states = layer.input_layernorm(hidden_states)
+        # 5a. Pre-attention norm (pre-norm only)
+        if _is_post_norm:
+            residual_pre_attn = hidden_states
+            attn_input = hidden_states
         else:
-            hidden_states, residual = layer.input_layernorm(
-                hidden_states, residual)
+            if residual is None:
+                residual = hidden_states
+                attn_input = layer.input_layernorm(hidden_states)
+            else:
+                attn_input, residual = layer.input_layernorm(
+                    hidden_states, residual)
 
         # 5b. QKV projection
-        qkv, _ = layer.self_attn.qkv_proj(hidden_states)
+        qkv, _ = layer.self_attn.qkv_proj(attn_input)
         q_size = layer.self_attn.q_size
         kv_size = layer.self_attn.kv_size
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+        # 5b.5. OLMo-2 qk_norm between qkv_proj and rotary
+        if hasattr(layer.self_attn, '_apply_qk_norm'):
+            q, k = layer.self_attn._apply_qk_norm(q, k)
 
         # 5c. RoPE rotation using the model's rotary_emb
         q, k = layer.self_attn.rotary_emb(repair_global, q, k)
@@ -862,12 +873,21 @@ def fast_selective_recompute(worker, new_seq_len, block_table,
 
         # 5g. Output projection
         attn_output = attn_output.view(num_repair, -1)
-        hidden_states, _ = layer.self_attn.o_proj(attn_output)
+        attn_proj, _ = layer.self_attn.o_proj(attn_output)
 
         # 5h. Post-attention LayerNorm + MLP
-        hidden_states, residual = layer.post_attention_layernorm(
-            hidden_states, residual)
-        hidden_states = layer.mlp(hidden_states)
+        if _is_post_norm:
+            attn_normed = layer.post_attention_layernorm(attn_proj)
+            hidden_states = residual_pre_attn + attn_normed
+            residual_pre_mlp = hidden_states
+            mlp_out = layer.mlp(hidden_states)
+            mlp_normed = layer.post_feedforward_layernorm(mlp_out)
+            hidden_states = residual_pre_mlp + mlp_normed
+        else:
+            hidden_states = attn_proj
+            hidden_states, residual = layer.post_attention_layernorm(
+                hidden_states, residual)
+            hidden_states = layer.mlp(hidden_states)
 
     torch.cuda.synchronize()
     t1 = time.perf_counter()
