@@ -384,6 +384,245 @@ def selective_recompute_with_tokens(worker, new_seq_len, block_table,
     }
 
 
+def fast_compose_recompute(worker, new_seq_len, block_table,
+                           head_dim, token_ids, check_layer=1,
+                           repair_ratio=0.15):
+    """CacheBlend-style composition repair: full early layers + selective later.
+
+    For composition (independently cached segments merged into one cache),
+    ALL cross-attention is missing. Standard fast_selective_recompute fails
+    at <100% budget because non-repair tokens have stale K,V at every layer.
+
+    CacheBlend's approach:
+      1. Run ALL tokens through layers [0, check_layer) — full recompute
+         This gives every token fresh hidden states with cross-attention.
+      2. At check_layer: compare fresh K against cached K (K-deviation).
+         Select top-k divergent tokens.
+      3. Run ONLY selected tokens through layers [check_layer, num_layers).
+         Each layer writes fresh K,V before attention, so subsequent layers
+         benefit from the repairs.
+
+    This achieves CacheBlend's 15% budget because:
+    - Early layers (0..check): full cost, but few layers (1-2)
+    - Later layers (check..N): selective, only top-k tokens
+
+    Args:
+        worker: vLLM GPU worker
+        new_seq_len: total sequence length in cache
+        block_table: physical block table
+        head_dim: attention head dimension
+        token_ids: full sequence token IDs (for embedding)
+        check_layer: which layer to compute K-deviation (default 1)
+        repair_ratio: fraction of tokens to selectively recompute after check
+
+    Returns:
+        dict with timing and repair counts
+    """
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    model_runner = worker.model_runner
+    model_obj = model_runner.model
+    llama_model = model_obj.model
+
+    kv_caches = model_runner.kv_caches
+    first_cache = kv_caches[0]
+    _, num_blocks, block_size, num_kv_heads, cache_head_dim = first_cache.shape
+    device = first_cache.device
+    num_layers = len(kv_caches)
+    num_q_heads = llama_model.layers[0].self_attn.num_heads
+
+    n_tokens = new_seq_len
+    assert n_tokens > 0
+
+    bt_t = torch.tensor(block_table, device=device, dtype=torch.long)
+
+    from vllm.v1.attention.backends.fa_utils import (
+        flash_attn_varlen_func,
+        get_flash_attn_version,
+        reshape_and_cache_flash,
+    )
+    fa_version = get_flash_attn_version()
+    scale = head_dim ** -0.5
+    k_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    v_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+
+    # Token embeddings
+    ids_t = torch.tensor(token_ids[:n_tokens], device=device, dtype=torch.long)
+    hidden_states = llama_model.embed_tokens(ids_t)
+
+    # Positions and FA metadata for FULL forward (all tokens, one sequence)
+    positions = torch.arange(n_tokens, device=device, dtype=torch.long)
+    cu_seqlens = torch.tensor([0, n_tokens], device=device, dtype=torch.int32)
+
+    # Slot mapping for reshape_and_cache_flash
+    all_logical = positions // block_size
+    all_offsets = positions % block_size
+    all_physical = bt_t[all_logical]
+    slot_mapping_all = all_physical * block_size + all_offsets
+
+    # Block table for paged FA (single sequence)
+    num_logical_blocks = (n_tokens + block_size - 1) // block_size
+    fa_block_row = bt_t[:num_logical_blocks].to(torch.int32)
+    fa_block_table_full = fa_block_row.unsqueeze(0).contiguous()
+
+    residual = None
+
+    # Phase 1: full forward through layers [0, check_layer]
+    for layer_idx in range(check_layer + 1):
+        layer = llama_model.layers[layer_idx]
+        kv_cache = kv_caches[layer_idx]
+        key_cache, value_cache = kv_cache.unbind(0)
+
+        if residual is None:
+            residual = hidden_states
+            hidden_states = layer.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = layer.input_layernorm(
+                hidden_states, residual)
+
+        qkv, _ = layer.self_attn.qkv_proj(hidden_states)
+        q_size = layer.self_attn.q_size
+        kv_size = layer.self_attn.kv_size
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        q, k = layer.self_attn.rotary_emb(positions, q, k)
+
+        q = q.view(n_tokens, num_q_heads, head_dim)
+        k = k.view(n_tokens, num_kv_heads, head_dim)
+        v = v.view(n_tokens, num_kv_heads, head_dim)
+
+        # At check_layer: compute K-deviation before overwriting
+        if layer_idx == check_layer:
+            # Read old (composed) K from cache
+            old_k = key_cache[all_physical, all_offsets]  # [n, kv_heads, hd]
+            # K-deviation: L2 distance per token
+            k_dev = (k.float() - old_k.float()).pow(2).sum(dim=[1, 2])  # [n]
+            # Select top-k
+            n_repair = max(1, int(n_tokens * repair_ratio))
+            top_indices = k_dev.topk(n_repair).indices.sort().values
+            repair_set = set(top_indices.tolist())
+
+        # Write fresh K, V to cache (ALL tokens for phases 0..check)
+        reshape_and_cache_flash(
+            k, v, key_cache, value_cache, slot_mapping_all,
+            kv_cache_dtype="auto", k_scale=k_scale, v_scale=v_scale,
+        )
+
+        # Full FlashAttention (paged, single sequence)
+        attn_output = torch.empty(n_tokens, num_q_heads, head_dim,
+                                  dtype=q.dtype, device=device)
+        flash_attn_varlen_func(
+            q=q, k=key_cache, v=value_cache,
+            out=attn_output,
+            cu_seqlens_q=cu_seqlens,
+            max_seqlen_q=n_tokens,
+            seqused_k=torch.tensor([n_tokens], device=device, dtype=torch.int32),
+            max_seqlen_k=n_tokens,
+            softmax_scale=scale,
+            causal=True,
+            block_table=fa_block_table_full,
+            fa_version=fa_version,
+        )
+
+        attn_output = attn_output.view(n_tokens, -1)
+        hidden_states, _ = layer.self_attn.o_proj(attn_output)
+        hidden_states, residual = layer.post_attention_layernorm(
+            hidden_states, residual)
+        hidden_states = layer.mlp(hidden_states)
+
+    torch.cuda.synchronize()
+    full_ms = (time.perf_counter() - t0) * 1000
+
+    # Phase 2: selective forward through layers [check_layer+1, num_layers)
+    # Only process tokens in repair_set
+    torch.cuda.synchronize()
+    t_selective = time.perf_counter()
+
+    repair_indices_t = top_indices
+    num_repair = len(repair_indices_t)
+
+    # Extract hidden states for repair tokens only
+    repair_hidden = hidden_states[repair_indices_t]
+    repair_residual = residual[repair_indices_t]
+
+    repair_positions = positions[repair_indices_t]
+    repair_logical = repair_positions // block_size
+    repair_offsets = repair_positions % block_size
+    repair_physical = bt_t[repair_logical]
+    repair_slots = repair_physical * block_size + repair_offsets
+
+    # FA metadata for repair tokens (each as separate sequence)
+    cu_seqlens_repair = torch.arange(
+        num_repair + 1, device=device, dtype=torch.int32)
+    seqused_k_repair = (repair_positions + 1).to(torch.int32)
+    fa_block_table_repair = fa_block_row.unsqueeze(0).expand(
+        num_repair, -1).contiguous()
+    max_seqlen_k_repair = int(seqused_k_repair.max().item())
+
+    hidden_states_r = repair_hidden
+    residual_r = repair_residual
+
+    for layer_idx in range(check_layer + 1, num_layers):
+        layer = llama_model.layers[layer_idx]
+        kv_cache = kv_caches[layer_idx]
+        key_cache, value_cache = kv_cache.unbind(0)
+
+        hidden_states_r, residual_r = layer.input_layernorm(
+            hidden_states_r, residual_r)
+
+        qkv, _ = layer.self_attn.qkv_proj(hidden_states_r)
+        q_size = layer.self_attn.q_size
+        kv_size = layer.self_attn.kv_size
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        q, k = layer.self_attn.rotary_emb(repair_positions, q, k)
+
+        q = q.view(num_repair, num_q_heads, head_dim)
+        k = k.view(num_repair, num_kv_heads, head_dim)
+        v = v.view(num_repair, num_kv_heads, head_dim)
+
+        # Write repair tokens' K,V to cache
+        reshape_and_cache_flash(
+            k, v, key_cache, value_cache, repair_slots,
+            kv_cache_dtype="auto", k_scale=k_scale, v_scale=v_scale,
+        )
+
+        # Paged FlashAttention for repair tokens
+        attn_output = torch.empty(num_repair, num_q_heads, head_dim,
+                                  dtype=q.dtype, device=device)
+        flash_attn_varlen_func(
+            q=q, k=key_cache, v=value_cache,
+            out=attn_output,
+            cu_seqlens_q=cu_seqlens_repair,
+            max_seqlen_q=1,
+            seqused_k=seqused_k_repair,
+            max_seqlen_k=max_seqlen_k_repair,
+            softmax_scale=scale,
+            causal=True,
+            block_table=fa_block_table_repair,
+            fa_version=fa_version,
+        )
+
+        attn_output = attn_output.view(num_repair, -1)
+        hidden_states_r, _ = layer.self_attn.o_proj(attn_output)
+        hidden_states_r, residual_r = layer.post_attention_layernorm(
+            hidden_states_r, residual_r)
+        hidden_states_r = layer.mlp(hidden_states_r)
+
+    torch.cuda.synchronize()
+    selective_ms = (time.perf_counter() - t_selective) * 1000
+    total_ms = (time.perf_counter() - t0) * 1000
+
+    return {
+        'total_ms': round(total_ms, 1),
+        'full_layers_ms': round(full_ms, 1),
+        'selective_layers_ms': round(selective_ms, 1),
+        'num_repaired': num_repair,
+        'num_total': n_tokens,
+        'check_layer': check_layer,
+        'repair_ratio': repair_ratio,
+    }
+
+
 def fast_selective_recompute(worker, new_seq_len, block_table,
                              repair_indices, head_dim, delete_start,
                              ac_token_ids):
