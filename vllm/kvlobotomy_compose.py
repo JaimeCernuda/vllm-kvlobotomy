@@ -878,27 +878,139 @@ def extract_segment_kv(worker, token_ids, start_pos, end_pos, block_table):
 # Fast INSERT (Path 2): independent B' prefill, no C extraction
 # ---------------------------------------------------------------------------
 
+def _prefill_independent_contiguous(worker, token_ids, head_dim):
+    """Prefill tokens independently using contiguous FlashAttention.
+
+    Returns per-layer K,V tensors (contiguous, not in paged cache).
+    B' sees only its own tokens — no external context.
+
+    Args:
+        worker: vLLM GPU worker
+        token_ids: list of token IDs to prefill
+        head_dim: attention head dimension
+
+    Returns:
+        keys: dict[layer_idx] -> [N, kv_heads, head_dim]
+        values: dict[layer_idx] -> [N, kv_heads, head_dim]
+    """
+    from vllm.v1.attention.backends.fa_utils import (
+        flash_attn_varlen_func,
+        get_flash_attn_version,
+    )
+
+    model_runner = worker.model_runner
+    llama_model = model_runner.model.model
+    kv_caches = model_runner.kv_caches
+
+    first_cache = kv_caches[0]
+    _, _, _, num_kv_heads, cache_head_dim = first_cache.shape
+    device = first_cache.device
+    num_layers = len(kv_caches)
+    num_q_heads = llama_model.layers[0].self_attn.num_heads
+    n_tokens = len(token_ids)
+
+    fa_version = get_flash_attn_version()
+    assert fa_version is not None, "FlashAttention not available"
+    scale = head_dim ** -0.5
+
+    # Token embeddings
+    ids_t = torch.tensor(token_ids, device=device, dtype=torch.long)
+    hidden_states = llama_model.embed_tokens(ids_t)
+
+    # Positions [0, n_tokens) — independent, no external context
+    positions = torch.arange(n_tokens, device=device, dtype=torch.long)
+
+    # Contiguous FA metadata: single sequence of length n_tokens
+    cu_seqlens = torch.tensor([0, n_tokens], device=device, dtype=torch.int32)
+
+    # Store K,V per layer
+    all_keys = {}
+    all_values = {}
+
+    residual = None
+
+    for layer_idx in range(num_layers):
+        layer = llama_model.layers[layer_idx]
+
+        # LayerNorm
+        if residual is None:
+            residual = hidden_states
+            hidden_states = layer.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = layer.input_layernorm(
+                hidden_states, residual)
+
+        # QKV projection
+        qkv, _ = layer.self_attn.qkv_proj(hidden_states)
+        q_size = layer.self_attn.q_size
+        kv_size = layer.self_attn.kv_size
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+        # RoPE at independent positions [0, n_tokens)
+        q, k = layer.self_attn.rotary_emb(positions, q, k)
+
+        # Reshape for FA
+        q = q.view(n_tokens, num_q_heads, head_dim)
+        k = k.view(n_tokens, num_kv_heads, head_dim)
+        v = v.view(n_tokens, num_kv_heads, head_dim)
+
+        # Store K,V for later scattering into paged cache
+        all_keys[layer_idx] = k.clone()
+        all_values[layer_idx] = v.clone()
+
+        # Contiguous FlashAttention: B' attends to itself only
+        # block_table=None → contiguous mode, cu_seqlens_k for lengths
+        attn_output = torch.empty(
+            n_tokens, num_q_heads, head_dim, dtype=q.dtype, device=device)
+
+        flash_attn_varlen_func(
+            q=q, k=k, v=v,
+            out=attn_output,
+            cu_seqlens_q=cu_seqlens,
+            max_seqlen_q=n_tokens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_k=n_tokens,
+            softmax_scale=scale,
+            causal=True,
+            fa_version=fa_version,
+        )
+
+        # Output projection
+        attn_output = attn_output.view(n_tokens, -1)
+        hidden_states, _ = layer.self_attn.o_proj(attn_output)
+
+        # MLP
+        hidden_states, residual = layer.post_attention_layernorm(
+            hidden_states, residual)
+        hidden_states = layer.mlp(hidden_states)
+
+    return all_keys, all_values
+
+
 def fast_insert(worker, ac_seq_len, block_table, b_prime_token_ids,
                 insert_pos, head_dim, rope_theta, num_kv_heads,
-                repair_ratio=0.15):
+                abc_token_ids=None, repair_ratio=0.15):
     """Insert B' into [A,C] → [A,B',C] via independent prefill (Path 2).
 
     Memory-efficient: no temporary C extraction buffer.
-    Uses CacheBlend-style independent prefill + selective recompute.
+    B' is prefilled independently using contiguous FlashAttention,
+    then scattered into the paged cache and RoPE-corrected.
+
+    Design tradeoff (Path 2 vs Path 1):
+      Path 1 (smart_insert): Extract C → prefill B' seeing A → write C back.
+        Memory: O(layers × C_len). Compute: lower repair.
+      Path 2 (this function): Prefill B' independently → shift C → repair.
+        Memory: O(layers × B'_len) for contiguous K,V. Compute: higher repair.
+      Path 2 preferred: memory is scarcer than compute in GPU serving.
 
     Steps:
-      1. Prefill B' independently via fast_selective_recompute
-         (B' sees only its own tokens — no A, no C context)
-      2. Shift C's KV within the cache: copy [insert_pos, ac_seq_len)
-         to [insert_pos + b_prime_len, ...) — in-place, reverse order
-         to handle overlap when B' > 0
-      3. Write B' KV (from independent prefill) into [insert_pos, ...)
-      4. RoPE-correct both B' and C keys for their final positions
-      5. Selective recompute (CacheBlend deviation-select pattern):
-         recompute divergent tokens to add missing cross-attention
-
-    Memory overhead: zero (no extraction buffer).
-    Compute overhead: higher repair (~15%) since B' has no A context.
+      1. Prefill B' independently (contiguous FA, B' sees only itself)
+      2. Shift C in-place within paged cache (reverse order for rightward)
+      3. Scatter B' K,V into paged cache at [insert_pos, ...)
+      4. RoPE-correct B' keys (from pos [0..) to [insert_pos..))
+         and C keys (from pos [insert_pos..) to [insert_pos+B'..))
+      5. Selective recompute: B' tokens (need A context) + C tokens
+         (need B' context) via fast_selective_recompute
 
     Args:
         worker: vLLM GPU worker
@@ -909,7 +1021,8 @@ def fast_insert(worker, ac_seq_len, block_table, b_prime_token_ids,
         head_dim: attention head dimension
         rope_theta: RoPE base frequency
         num_kv_heads: number of KV heads
-        repair_ratio: fraction of tokens to selectively recompute (0.15 default)
+        abc_token_ids: full [A, B', C] token IDs (needed for repair)
+        repair_ratio: fraction of C tokens to selectively recompute
 
     Returns:
         dict with per-step timing breakdown
@@ -919,7 +1032,7 @@ def fast_insert(worker, ac_seq_len, block_table, b_prime_token_ids,
 
     kv_caches = worker.model_runner.kv_caches
     first_cache = kv_caches[0]
-    _, num_blocks_total, block_size, _, _ = first_cache.shape
+    _, _, block_size, _, _ = first_cache.shape
     device = first_cache.device
     num_layers = len(kv_caches)
 
@@ -943,76 +1056,39 @@ def fast_insert(worker, ac_seq_len, block_table, b_prime_token_ids,
     timings = {}
 
     # ------------------------------------------------------------------
-    # Step 1: Prefill B' independently
-    # B' gets its own KV computed in isolation (sees only itself).
-    # We use fast_selective_recompute with B' tokens as "repair" targets
-    # in a sequence of length b_prime_len.
+    # Step 1: Prefill B' independently (contiguous FlashAttention)
+    # B' sees only its own tokens. Returns contiguous K,V per layer.
+    # Memory: O(layers × B'_len × kv_heads × head_dim) — small.
     # ------------------------------------------------------------------
     torch.cuda.synchronize()
     t_prefill = time.perf_counter()
 
-    from vllm.kvlobotomy_repair import fast_selective_recompute
-
-    # Prefill B' as a standalone sequence at positions [0, b_prime_len).
-    # We write B' KV to temporary positions at the END of the block table
-    # (after the final sequence) to avoid overwriting A or C.
-    # Then we'll copy them into place in step 3.
-    #
-    # Alternative: use contiguous FA (not paged) for B' prefill.
-    # For now: write to positions [final_seq_len, final_seq_len+b_prime_len)
-    # which are unused tail of the block table.
-    temp_start = final_seq_len
-    temp_blocks_needed = (temp_start + b_prime_len + block_size - 1) // block_size
-    assert len(block_table) >= temp_blocks_needed, (
-        f"Block table too small for temp B' storage: need {temp_blocks_needed}, "
-        f"have {len(block_table)}"
-    )
-
-    # Use fast_selective_recompute to prefill B' tokens at temp positions
-    b_indices = list(range(b_prime_len))
-    b_global_positions = list(range(b_prime_len))  # B' sees itself at [0, b_prime_len)
-
-    # Build a minimal token ID sequence for the temp prefill
-    # The sequence is just B' tokens at positions [0, b_prime_len)
-    fast_selective_recompute(
-        worker=worker,
-        new_seq_len=temp_start + b_prime_len,
-        block_table=block_table,
-        repair_indices=b_indices,
-        head_dim=head_dim,
-        delete_start=temp_start,  # B' tokens start at temp_start
-        ac_token_ids=([0] * temp_start) + list(b_prime_token_ids),
-    )
+    b_keys, b_values = _prefill_independent_contiguous(
+        worker, b_prime_token_ids, head_dim)
 
     torch.cuda.synchronize()
     timings['prefill_ms'] = round((time.perf_counter() - t_prefill) * 1000, 1)
 
     # ------------------------------------------------------------------
-    # Step 2: Shift C within cache (in-place, reverse order for overlap)
-    # C is at [insert_pos, insert_pos + c_len) → move to
-    # [insert_pos + b_prime_len, insert_pos + b_prime_len + c_len)
+    # Step 2: Shift C in-place (reverse order for rightward shift)
+    # C: [insert_pos, ac_seq_len) → [insert_pos + B'_len, final_seq_len)
     # ------------------------------------------------------------------
     torch.cuda.synchronize()
     t_shift = time.perf_counter()
 
     if c_len > 0 and b_prime_len > 0:
-        # Reverse order to handle rightward shift without overwriting
-        c_old_positions = torch.arange(
+        c_old = torch.arange(
             insert_pos + c_len - 1, insert_pos - 1, -1,
-            device=device, dtype=torch.long,
-        )
-        c_new_positions = c_old_positions + b_prime_len
+            device=device, dtype=torch.long)
+        c_new = c_old + b_prime_len
 
-        old_log = c_old_positions // block_size
-        old_off = c_old_positions % block_size
-        old_blk = bt_t[old_log]
+        old_blk = bt_t[c_old // block_size]
+        old_off = c_old % block_size
+        new_blk = bt_t[c_new // block_size]
+        new_off = c_new % block_size
 
-        new_log = c_new_positions // block_size
-        new_off = c_new_positions % block_size
-        new_blk = bt_t[new_log]
-
-        for layer_idx in range(num_layers):
-            kv = kv_caches[layer_idx]
+        for li in range(num_layers):
+            kv = kv_caches[li]
             kv[0][new_blk, new_off] = kv[0][old_blk, old_off]
             kv[1][new_blk, new_off] = kv[1][old_blk, old_off]
 
@@ -1020,128 +1096,88 @@ def fast_insert(worker, ac_seq_len, block_table, b_prime_token_ids,
     timings['shift_ms'] = round((time.perf_counter() - t_shift) * 1000, 1)
 
     # ------------------------------------------------------------------
-    # Step 3: Copy B' KV from temp positions to final positions
-    # Temp: [temp_start, temp_start + b_prime_len)
-    # Final: [insert_pos, insert_pos + b_prime_len)
+    # Step 3: Scatter B' K,V into paged cache at final positions
     # ------------------------------------------------------------------
     torch.cuda.synchronize()
-    t_copy_b = time.perf_counter()
+    t_scatter = time.perf_counter()
 
-    b_temp_positions = torch.arange(
-        temp_start, temp_start + b_prime_len, device=device, dtype=torch.long,
-    )
-    b_final_positions = torch.arange(
-        insert_pos, insert_pos + b_prime_len, device=device, dtype=torch.long,
-    )
+    b_pos = torch.arange(
+        insert_pos, insert_pos + b_prime_len, device=device, dtype=torch.long)
+    b_blk = bt_t[b_pos // block_size]
+    b_off = b_pos % block_size
 
-    temp_log = b_temp_positions // block_size
-    temp_off = b_temp_positions % block_size
-    temp_blk = bt_t[temp_log]
-
-    final_log = b_final_positions // block_size
-    final_off = b_final_positions % block_size
-    final_blk = bt_t[final_log]
-
-    for layer_idx in range(num_layers):
-        kv = kv_caches[layer_idx]
-        kv[0][final_blk, final_off] = kv[0][temp_blk, temp_off]
-        kv[1][final_blk, final_off] = kv[1][temp_blk, temp_off]
+    for li in range(num_layers):
+        kv_caches[li][0][b_blk, b_off] = b_keys[li]
+        kv_caches[li][1][b_blk, b_off] = b_values[li]
 
     torch.cuda.synchronize()
-    timings['copy_b_ms'] = round((time.perf_counter() - t_copy_b) * 1000, 1)
+    timings['scatter_ms'] = round((time.perf_counter() - t_scatter) * 1000, 1)
 
     # ------------------------------------------------------------------
-    # Step 4: RoPE-correct B' and C keys for their final positions
-    # B' was prefilled at positions [0, b_prime_len) but lives at
-    # [insert_pos, insert_pos + b_prime_len) in the final sequence.
-    # C was at [insert_pos, insert_pos + c_len) but now lives at
-    # [insert_pos + b_prime_len, ...).
+    # Step 4: RoPE-correct B' and C keys
+    # B' prefilled at [0..B'_len) → final [insert_pos..insert_pos+B'_len)
+    # C was at [insert_pos..insert_pos+C_len) → [insert_pos+B'_len..final)
     # ------------------------------------------------------------------
     torch.cuda.synchronize()
     t_rope = time.perf_counter()
 
-    # B' RoPE correction: old_pos=[0..b_prime_len), new_pos=[insert_pos..insert_pos+b_prime_len)
+    # B' RoPE: undo pos [0..B'), redo pos [insert_pos..insert_pos+B')
     b_old_pos = torch.arange(b_prime_len, device=device, dtype=torch.long)
     b_new_pos = b_old_pos + insert_pos
+    for li in range(num_layers):
+        k = kv_caches[li][0][b_blk, b_off]
+        kv_caches[li][0][b_blk, b_off] = _rope_correct_keys_via_cache(
+            k, b_old_pos, b_new_pos, cos_sin_cache, is_neox)
 
-    for layer_idx in range(num_layers):
-        key_cache = kv_caches[layer_idx][0]
-        b_keys = key_cache[final_blk, final_off]
-        b_corrected = _rope_correct_keys_via_cache(
-            b_keys, b_old_pos, b_new_pos, cos_sin_cache, is_neox,
-        )
-        key_cache[final_blk, final_off] = b_corrected
-
-    # C RoPE correction: old_pos=[insert_pos..insert_pos+c_len),
-    #                    new_pos=[insert_pos+b_prime_len..final_seq_len)
+    # C RoPE: undo pos [insert_pos..+C), redo pos [insert_pos+B'..final)
     if c_len > 0:
-        c_final_positions = torch.arange(
-            insert_pos + b_prime_len, final_seq_len,
-            device=device, dtype=torch.long,
-        )
         c_old_pos = torch.arange(
-            insert_pos, insert_pos + c_len,
-            device=device, dtype=torch.long,
-        )
-        c_log = c_final_positions // block_size
-        c_off = c_final_positions % block_size
-        c_blk = bt_t[c_log]
-
-        for layer_idx in range(num_layers):
-            key_cache = kv_caches[layer_idx][0]
-            c_keys = key_cache[c_blk, c_off]
-            c_corrected = _rope_correct_keys_via_cache(
-                c_keys, c_old_pos, c_final_positions, cos_sin_cache, is_neox,
-            )
-            key_cache[c_blk, c_off] = c_corrected
+            insert_pos, insert_pos + c_len, device=device, dtype=torch.long)
+        c_new_pos = c_old_pos + b_prime_len
+        c_blk = bt_t[c_new_pos // block_size]
+        c_off = c_new_pos % block_size
+        for li in range(num_layers):
+            k = kv_caches[li][0][c_blk, c_off]
+            kv_caches[li][0][c_blk, c_off] = _rope_correct_keys_via_cache(
+                k, c_old_pos, c_new_pos, cos_sin_cache, is_neox)
 
     torch.cuda.synchronize()
     timings['rope_ms'] = round((time.perf_counter() - t_rope) * 1000, 1)
 
     # ------------------------------------------------------------------
-    # Step 5: Selective recompute (CacheBlend deviation-select pattern)
-    # Recompute tokens whose KV diverges most from correct values.
-    # B' tokens need A context. C tokens need B' context.
+    # Step 5: Selective recompute (CacheBlend deviation-select)
+    # B' needs A↔B' cross-attention. C needs B'↔C cross-attention.
+    # All B' tokens are repair targets (they saw nothing).
+    # Top repair_ratio of C tokens are repair targets.
     # ------------------------------------------------------------------
     torch.cuda.synchronize()
     t_repair = time.perf_counter()
 
     num_repaired = 0
-    if repair_ratio > 0 and (b_prime_len + c_len) > 0:
-        # Repair targets: all B' tokens + first repair_ratio of C tokens
-        # B' needs repair because it was prefilled independently (no A context)
-        # C needs repair because it never saw B'
-        b_repair = list(range(b_prime_len))
-        c_repair_count = max(1, int(c_len * repair_ratio))
-        c_repair = list(range(b_prime_len, b_prime_len + c_repair_count))
-        all_repair = b_repair + c_repair
+    if repair_ratio > 0 and abc_token_ids is not None:
+        from vllm.kvlobotomy_repair import fast_selective_recompute
 
-        # Build full AB'C token IDs
-        # We don't have A's token IDs here — we need them from the caller.
-        # For now, read A's token IDs from... we can't.
-        # The caller must provide the full AB'C token IDs.
-        #
-        # WORKAROUND: repair B' and C using fast_selective_recompute
-        # with the token IDs we do have.
-        # B' token IDs: b_prime_token_ids
-        # C token IDs: we don't have them.
-        #
-        # This is a limitation — the caller needs to pass ac_token_ids.
-        # For now, skip repair if no token IDs available.
-        # The proper fix: accept ab_prime_c_token_ids as a parameter.
-        pass
+        # All B' tokens need repair (saw no A context)
+        b_repair = list(range(b_prime_len))
+        # Top repair_ratio of C tokens
+        c_repair_n = max(1, int(c_len * repair_ratio))
+        c_repair = list(range(b_prime_len, b_prime_len + c_repair_n))
+        all_repair = b_repair + c_repair
+        num_repaired = len(all_repair)
+
+        fast_selective_recompute(
+            worker=worker,
+            new_seq_len=final_seq_len,
+            block_table=block_table,
+            repair_indices=all_repair,
+            head_dim=head_dim,
+            delete_start=insert_pos,  # B'+C start at insert_pos
+            ac_token_ids=list(abc_token_ids),
+        )
 
     torch.cuda.synchronize()
     timings['repair_ms'] = round((time.perf_counter() - t_repair) * 1000, 1)
 
-    # Zero temp storage
-    if b_prime_len > 0:
-        for layer_idx in range(num_layers):
-            kv = kv_caches[layer_idx]
-            kv[0][temp_blk, temp_off] = 0
-            kv[1][temp_blk, temp_off] = 0
-
-    torch.cuda.synchronize()
     total_ms = (time.perf_counter() - t0) * 1000
 
     return {
@@ -1156,7 +1192,7 @@ def fast_insert(worker, ac_seq_len, block_table, b_prime_token_ids,
 
 def fast_replace(worker, total_seq_len, block_table, b_prime_token_ids,
                  delete_start, delete_end, head_dim, rope_theta,
-                 num_kv_heads, repair_ratio=0.15):
+                 num_kv_heads, abc_token_ids=None, repair_ratio=0.15):
     """Replace B with B' in [A,B,C] via independent B' prefill (Path 2).
 
     Memory-efficient: no C extraction buffer.
@@ -1164,8 +1200,8 @@ def fast_replace(worker, total_seq_len, block_table, b_prime_token_ids,
     Steps:
       1. Shift C from [delete_end, total_seq_len) to
          [delete_start + b_prime_len, ...) — in-place
-      2. Prefill B' independently via fast_selective_recompute
-      3. Write B' KV to [delete_start, delete_start + b_prime_len)
+      2. Prefill B' independently (contiguous FA)
+      3. Scatter B' KV into paged cache
       4. RoPE-correct B' and C
       5. Selective recompute for cross-attention repair
 
@@ -1177,6 +1213,7 @@ def fast_replace(worker, total_seq_len, block_table, b_prime_token_ids,
         delete_start: start of old B (inclusive)
         delete_end: end of old B (exclusive)
         head_dim, rope_theta, num_kv_heads: model params
+        abc_token_ids: full [A, B', C] token IDs (needed for repair)
         repair_ratio: fraction of tokens to selectively recompute
 
     Returns:
@@ -1254,6 +1291,7 @@ def fast_replace(worker, total_seq_len, block_table, b_prime_token_ids,
         head_dim=head_dim,
         rope_theta=rope_theta,
         num_kv_heads=num_kv_heads,
+        abc_token_ids=abc_token_ids,
         repair_ratio=repair_ratio,
     )
 
