@@ -386,7 +386,7 @@ def selective_recompute_with_tokens(worker, new_seq_len, block_table,
 
 def fast_compose_recompute(worker, new_seq_len, block_table,
                            head_dim, token_ids, check_layer=1,
-                           repair_ratio=0.15):
+                           repair_ratio=0.15, selection='kdev'):
     """CacheBlend-style composition repair: full early layers + selective later.
 
     For composition (independently cached segments merged into one cache),
@@ -491,15 +491,23 @@ def fast_compose_recompute(worker, new_seq_len, block_table,
         k = k.view(n_tokens, num_kv_heads, head_dim)
         v = v.view(n_tokens, num_kv_heads, head_dim)
 
-        # At check_layer: compute K-deviation before overwriting
+        # At check_layer: pick which tokens to repair
         if layer_idx == check_layer:
-            # Read old (composed) K from cache
-            old_k = key_cache[all_physical, all_offsets]  # [n, kv_heads, hd]
-            # K-deviation: L2 distance per token
-            k_dev = (k.float() - old_k.float()).pow(2).sum(dim=[1, 2])  # [n]
-            # Select top-k
             n_repair = max(1, int(n_tokens * repair_ratio))
-            top_indices = k_dev.topk(n_repair).indices.sort().values
+            if selection == 'kdev':
+                # CacheBlend: K-deviation against stale composed K
+                old_k = key_cache[all_physical, all_offsets]  # [n, kv_heads, hd]
+                k_dev = (k.float() - old_k.float()).pow(2).sum(dim=[1, 2])
+                top_indices = k_dev.topk(n_repair).indices.sort().values
+            elif selection == 'random':
+                # Random subset — tests whether k-deviation actually helps
+                perm = torch.randperm(n_tokens, device=device)
+                top_indices = perm[:n_repair].sort().values
+            elif selection == 'last':
+                # Repair the last tokens only (attention-sink-like baseline)
+                top_indices = torch.arange(n_tokens - n_repair, n_tokens, device=device, dtype=torch.long)
+            else:
+                raise ValueError(f'unknown selection: {selection}')
             repair_set = set(top_indices.tolist())
 
         # Write fresh K, V to cache (ALL tokens for phases 0..check)
