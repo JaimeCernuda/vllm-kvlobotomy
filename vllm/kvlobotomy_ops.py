@@ -276,10 +276,34 @@ def kvlobotomy_full_delete(worker, delete_start, delete_end, rope_storage,
     # If not provided, falls back to identity mapping.
     _bt_tensor = None  # lazily built on first layer
 
+    # Detect MLA layout: kv_cache is a single 3D tensor
+    # [num_blocks, block_size, head_size] instead of a tuple of
+    # [num_blocks, block_size, kv_heads, head_dim] for key and value.
+    _probe = kv_caches[0]
+    _is_mla = hasattr(_probe, 'ndim') and _probe.ndim == 3
+    # For MLA (DeepSeek-V2/V3): rope only applies to the last qk_rope_head_dim
+    # dims of each latent row. The first kv_lora_rank dims are rope-free.
+    # Discover these from the attention module.
+    _mla_rope_start = 0
+    _mla_rope_dim = None
+    if _is_mla:
+        attn0 = worker.model_runner.model.model.layers[0].self_attn
+        _mla_rope_start = getattr(attn0, 'kv_lora_rank', 512)
+        _mla_rope_dim = getattr(attn0, 'qk_rope_head_dim', 64)
+
     for layer_idx, kv_cache in enumerate(kv_caches):
-        key_cache = kv_cache[0]   # [num_blocks, block_size, kv_heads, head_dim]
-        val_cache = kv_cache[1]   # [num_blocks, block_size, kv_heads, head_dim]
-        block_size = key_cache.shape[1]
+        if _is_mla:
+            # MLA: single tensor per layer, shape [num_blocks, block_size, head_size]
+            # There is no separate value cache — V is derived at attention time
+            # from the compressed latent via kv_b_proj. We shift the latent rows
+            # exactly like the standard key cache, then rotate only the rope tail.
+            key_cache = kv_cache       # [num_blocks, block_size, head_size]
+            val_cache = None            # not used in MLA path
+            block_size = key_cache.shape[1]
+        else:
+            key_cache = kv_cache[0]   # [num_blocks, block_size, kv_heads, head_dim]
+            val_cache = kv_cache[1]   # [num_blocks, block_size, kv_heads, head_dim]
+            block_size = key_cache.shape[1]
 
         # Build block table tensor on first layer (same for all layers)
         if _bt_tensor is None and block_table is not None:
@@ -314,16 +338,32 @@ def kvlobotomy_full_delete(worker, delete_start, delete_end, rope_storage,
 
             # Gather C+suffix keys and values (fancy indexing = copy)
             c_keys = key_cache[old_blocks, old_offsets]
-            c_vals = val_cache[old_blocks, old_offsets]
+            # [N, kv_heads, head_dim] for standard; [N, head_size] for MLA
+            if val_cache is not None:
+                c_vals = val_cache[old_blocks, old_offsets]
 
             # Post-RoPE: delta-rotate keys to correct positions
             if rope_storage == "post":
                 torch.cuda.synchronize()
                 t_rot_start = time.perf_counter()
 
-                c_keys = apply_delta_rotation(
-                    c_keys, old_positions, -delete_len, head_dim, rope_theta,
-                )
+                if _is_mla:
+                    # MLA: rotation only over [rope_start:rope_start+rope_dim]
+                    # and c_keys is 2D [N, head_size=576]. apply_delta_rotation
+                    # expects 3D [N, H, D]; add a fake head dim.
+                    c_keys_3d = c_keys.unsqueeze(1)  # [N, 1, 576]
+                    c_keys_3d = apply_delta_rotation(
+                        c_keys_3d, old_positions, -delete_len,
+                        head_dim=c_keys_3d.shape[-1],
+                        rope_theta=rope_theta,
+                        rope_start=_mla_rope_start,
+                        rope_dim=_mla_rope_dim,
+                    )
+                    c_keys = c_keys_3d.squeeze(1)
+                else:
+                    c_keys = apply_delta_rotation(
+                        c_keys, old_positions, -delete_len, head_dim, rope_theta,
+                    )
 
                 torch.cuda.synchronize()
                 t_rot_end = time.perf_counter()
@@ -331,7 +371,8 @@ def kvlobotomy_full_delete(worker, delete_start, delete_end, rope_storage,
 
             # Scatter to compacted positions
             key_cache[new_blocks, new_offsets] = c_keys
-            val_cache[new_blocks, new_offsets] = c_vals
+            if val_cache is not None:
+                val_cache[new_blocks, new_offsets] = c_vals
 
         # Zero out stale tail: positions [new_seq_len, total_seq_len)
         # Prevents any residual data from being accessible
@@ -347,7 +388,8 @@ def kvlobotomy_full_delete(worker, delete_start, delete_end, rope_storage,
             else:
                 stale_blocks = stale_logical
             key_cache[stale_blocks, stale_offsets] = 0
-            val_cache[stale_blocks, stale_offsets] = 0
+            if val_cache is not None:
+                val_cache[stale_blocks, stale_offsets] = 0
 
         torch.cuda.synchronize()
         t_copy_end = time.perf_counter()
