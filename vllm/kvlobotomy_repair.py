@@ -494,11 +494,39 @@ def fast_compose_recompute(worker, new_seq_len, block_table,
         # At check_layer: pick which tokens to repair
         if layer_idx == check_layer:
             n_repair = max(1, int(n_tokens * repair_ratio))
-            if selection == 'kdev':
+            if selection == 'cacheblend':
+                # EXACT CacheBlend selection: V-deviation at check_layer.
+                # Their xformers.py line 210:
+                #   temp_diff = ((value[:-last_len] - value_old[:-last_len])**2).sum(dim=[1,2])
+                # Also: always include the last `last_len` tokens (suffix/query).
+                # We treat the last 5% as the "suffix" since our composed cache
+                # includes the question tail. If repair_ratio * n_tokens < last_len
+                # CacheBlend would effectively only repair the suffix.
+                old_v = value_cache[all_physical, all_offsets]  # [n, kv_heads, hd]
+                v_dev = (v.float() - old_v.float()).pow(2).sum(dim=[1, 2])
+                # Suffix: last ~5% of tokens or min 16 tokens (query)
+                suffix_len = max(16, int(n_tokens * 0.05))
+                suffix_len = min(suffix_len, n_tokens)
+                last_idx = torch.arange(n_tokens - suffix_len, n_tokens, device=device, dtype=torch.long)
+                v_dev[last_idx] = float('-inf')  # don't double-pick
+                n_free = max(0, n_repair - suffix_len)
+                if n_free > 0:
+                    kdev_idx = v_dev.topk(n_free).indices
+                    top_indices = torch.cat([kdev_idx, last_idx]).sort().values
+                else:
+                    top_indices = last_idx.sort().values
+            elif selection == 'kdev':
                 # CacheBlend: K-deviation against stale composed K
+                # NOTE: This was my misreading. CacheBlend actually uses V-diff
+                # (see 'cacheblend' selector). Kept for ablation.
                 old_k = key_cache[all_physical, all_offsets]  # [n, kv_heads, hd]
                 k_dev = (k.float() - old_k.float()).pow(2).sum(dim=[1, 2])
                 top_indices = k_dev.topk(n_repair).indices.sort().values
+            elif selection == 'vdev':
+                # V-deviation without CacheBlend's suffix pinning.
+                old_v = value_cache[all_physical, all_offsets]
+                v_dev = (v.float() - old_v.float()).pow(2).sum(dim=[1, 2])
+                top_indices = v_dev.topk(n_repair).indices.sort().values
             elif selection == 'random':
                 # Random subset — tests whether k-deviation actually helps
                 perm = torch.randperm(n_tokens, device=device)
