@@ -875,7 +875,136 @@ def extract_segment_kv(worker, token_ids, start_pos, end_pos, block_table):
 
 
 # ---------------------------------------------------------------------------
-# Fast INSERT (Path 2): independent B' prefill, no C extraction
+# Fast INSERT Path 1: B' sees A (paged FA), C extracted to buffer
+# Memory: O(layers × C_len). Compute: lower repair (B' has A context).
+# ---------------------------------------------------------------------------
+
+def fast_insert_v1(worker, ac_seq_len, block_table, b_prime_token_ids,
+                   insert_pos, head_dim, rope_theta, num_kv_heads,
+                   abc_token_ids=None, repair_ratio=0.05):
+    """Insert B' seeing A context. C extracted and rewritten.
+
+    Path 1: B' prefilled via paged FlashAttention reading A's KV from cache.
+    C is extracted before B' overwrites its positions, then rewritten after.
+    Memory overhead: O(layers × C_len × kv_heads × head_dim).
+    Lower repair budget needed since B' already has A cross-attention.
+    """
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    kv_caches = worker.model_runner.kv_caches
+    first_cache = kv_caches[0]
+    _, _, block_size, _, _ = first_cache.shape
+    device = first_cache.device
+    num_layers = len(kv_caches)
+
+    b_prime_len = len(b_prime_token_ids)
+    c_len = ac_seq_len - insert_pos
+    final_seq_len = insert_pos + b_prime_len + c_len
+
+    bt_t = torch.tensor(block_table, device=device, dtype=torch.long)
+    final_blocks = (final_seq_len + block_size - 1) // block_size
+    assert len(block_table) >= final_blocks
+
+    llama_model = worker.model_runner.model.model
+    rotary_emb = llama_model.layers[0].self_attn.rotary_emb
+    cos_sin_cache = rotary_emb.cos_sin_cache
+    is_neox = rotary_emb.is_neox_style
+
+    timings = {}
+
+    # Step 1: Extract C's KV (memory overhead here)
+    torch.cuda.synchronize()
+    t_extract = time.perf_counter()
+    c_keys, c_values = _extract_kv(
+        kv_caches, insert_pos, ac_seq_len, bt_t, block_size)
+    torch.cuda.synchronize()
+    timings['extract_ms'] = round((time.perf_counter() - t_extract) * 1000, 1)
+
+    # Step 2: Prefill B' via fast_selective_recompute (sees A from paged cache)
+    # B' tokens at positions [insert_pos, insert_pos+b_prime_len)
+    # seqused_k[i] = insert_pos + i + 1 → reads A + earlier B' tokens
+    torch.cuda.synchronize()
+    t_prefill = time.perf_counter()
+
+    from vllm.kvlobotomy_repair import fast_selective_recompute
+
+    # Build token IDs: we need abc_token_ids for the embedding lookup.
+    # B' tokens at [insert_pos..insert_pos+b_prime_len) in the final seq.
+    if abc_token_ids is None:
+        # Fallback: pad with zeros for A, insert B' tokens
+        abc_token_ids = [0] * insert_pos + list(b_prime_token_ids) + [0] * c_len
+
+    fast_selective_recompute(
+        worker=worker,
+        new_seq_len=final_seq_len,
+        block_table=block_table,
+        repair_indices=list(range(b_prime_len)),
+        head_dim=head_dim,
+        delete_start=insert_pos,
+        ac_token_ids=list(abc_token_ids),
+    )
+    torch.cuda.synchronize()
+    timings['prefill_ms'] = round((time.perf_counter() - t_prefill) * 1000, 1)
+
+    # Step 3: Write C back at [insert_pos + b_prime_len, ...)
+    torch.cuda.synchronize()
+    t_write = time.perf_counter()
+    c_new_start = insert_pos + b_prime_len
+    _write_kv(kv_caches, c_new_start, c_keys, c_values, bt_t, block_size)
+    torch.cuda.synchronize()
+    timings['write_c_ms'] = round((time.perf_counter() - t_write) * 1000, 1)
+
+    # Step 4: RoPE-correct C keys
+    torch.cuda.synchronize()
+    t_rope = time.perf_counter()
+    if c_len > 0:
+        c_old_pos = torch.arange(
+            insert_pos, insert_pos + c_len, device=device, dtype=torch.long)
+        c_new_pos = c_old_pos + b_prime_len
+        c_blk = bt_t[c_new_pos // block_size]
+        c_off = c_new_pos % block_size
+        for li in range(num_layers):
+            k = kv_caches[li][0][c_blk, c_off]
+            kv_caches[li][0][c_blk, c_off] = _rope_correct_keys_via_cache(
+                k, c_old_pos, c_new_pos, cos_sin_cache, is_neox)
+    torch.cuda.synchronize()
+    timings['rope_ms'] = round((time.perf_counter() - t_rope) * 1000, 1)
+
+    # Step 5: Optional repair for C (C needs B' context)
+    torch.cuda.synchronize()
+    t_repair = time.perf_counter()
+    num_repaired = 0
+    if repair_ratio > 0 and c_len > 0 and abc_token_ids is not None:
+        c_repair_n = max(1, int(c_len * repair_ratio))
+        c_repair_indices = list(range(b_prime_len, b_prime_len + c_repair_n))
+        num_repaired = len(c_repair_indices)
+        fast_selective_recompute(
+            worker=worker,
+            new_seq_len=final_seq_len,
+            block_table=block_table,
+            repair_indices=c_repair_indices,
+            head_dim=head_dim,
+            delete_start=insert_pos,
+            ac_token_ids=list(abc_token_ids),
+        )
+    torch.cuda.synchronize()
+    timings['repair_ms'] = round((time.perf_counter() - t_repair) * 1000, 1)
+
+    total_ms = (time.perf_counter() - t0) * 1000
+    return {
+        **timings,
+        'total_ms': round(total_ms, 1),
+        'b_prime_len': b_prime_len,
+        'c_len': c_len,
+        'final_seq_len': final_seq_len,
+        'num_repaired': num_repaired,
+        'path': 'v1_memory',
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fast INSERT Path 2: independent B' prefill, no C extraction
 # ---------------------------------------------------------------------------
 
 def _prefill_independent_contiguous(worker, token_ids, head_dim):
