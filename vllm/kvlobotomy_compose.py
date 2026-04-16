@@ -250,7 +250,9 @@ def _prefill_b_prime(worker, b_prime_token_ids, insert_pos, a_len,
 
     rotary_emb = llama_model.layers[0].self_attn.rotary_emb
     cos_sin_cache = _get_rotary_cos_sin_cache(rotary_emb)
-    is_neox = rotary_emb.is_neox_style
+    # Most vLLM rotary_emb expose is_neox_style; Phi3LongRoPE hardcodes neox
+    # in its forward and doesn't set the attr — default True for those.
+    is_neox = getattr(rotary_emb, 'is_neox_style', True)
 
     b_prime_len = len(b_prime_token_ids)
     bt_t = block_table_tensor
@@ -432,7 +434,9 @@ def smart_insert(worker, ac_seq_len, block_table, b_prime_token_ids,
     llama_model = worker.model_runner.model.model
     rotary_emb = llama_model.layers[0].self_attn.rotary_emb
     cos_sin_cache = _get_rotary_cos_sin_cache(rotary_emb)
-    is_neox = rotary_emb.is_neox_style
+    # Most vLLM rotary_emb expose is_neox_style; Phi3LongRoPE hardcodes neox
+    # in its forward and doesn't set the attr — default True for those.
+    is_neox = getattr(rotary_emb, 'is_neox_style', True)
 
     # --- Step 1: Extract C's KV from cache ---
     torch.cuda.synchronize()
@@ -581,7 +585,9 @@ def smart_replace(worker, total_seq_len, block_table, b_prime_token_ids,
     llama_model = worker.model_runner.model.model
     rotary_emb = llama_model.layers[0].self_attn.rotary_emb
     cos_sin_cache = _get_rotary_cos_sin_cache(rotary_emb)
-    is_neox = rotary_emb.is_neox_style
+    # Most vLLM rotary_emb expose is_neox_style; Phi3LongRoPE hardcodes neox
+    # in its forward and doesn't set the attr — default True for those.
+    is_neox = getattr(rotary_emb, 'is_neox_style', True)
 
     # Validate block table
     final_blocks_needed = (final_seq_len + block_size - 1) // block_size
@@ -950,7 +956,9 @@ def fast_insert_v1(worker, ac_seq_len, block_table, b_prime_token_ids,
     llama_model = worker.model_runner.model.model
     rotary_emb = llama_model.layers[0].self_attn.rotary_emb
     cos_sin_cache = _get_rotary_cos_sin_cache(rotary_emb)
-    is_neox = rotary_emb.is_neox_style
+    # Most vLLM rotary_emb expose is_neox_style; Phi3LongRoPE hardcodes neox
+    # in its forward and doesn't set the attr — default True for those.
+    is_neox = getattr(rotary_emb, 'is_neox_style', True)
 
     timings = {}
 
@@ -1228,7 +1236,9 @@ def fast_insert(worker, ac_seq_len, block_table, b_prime_token_ids,
     llama_model = worker.model_runner.model.model
     rotary_emb = llama_model.layers[0].self_attn.rotary_emb
     cos_sin_cache = _get_rotary_cos_sin_cache(rotary_emb)
-    is_neox = rotary_emb.is_neox_style
+    # Most vLLM rotary_emb expose is_neox_style; Phi3LongRoPE hardcodes neox
+    # in its forward and doesn't set the attr — default True for those.
+    is_neox = getattr(rotary_emb, 'is_neox_style', True)
 
     timings = {}
 
