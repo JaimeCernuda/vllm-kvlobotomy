@@ -235,6 +235,19 @@ def _prefill_b_prime(worker, b_prime_token_ids, insert_pos, a_len,
     head_dim = kv_caches[0][0].shape[3]
     num_q_heads = llama_model.layers[0].self_attn.num_heads
 
+    # fast_insert reruns a pre-norm layer forward: input_layernorm -> qkv_proj -> ...
+    # OLMo-2 and similar post-norm architectures lack `input_layernorm` entirely,
+    # so our forward path breaks. Detect early and emit a clear, actionable error
+    # rather than crashing on AttributeError deep inside a for-loop.
+    _first_layer = llama_model.layers[0]
+    if not hasattr(_first_layer, 'input_layernorm'):
+        raise NotImplementedError(
+            f'fast_insert requires a pre-norm decoder layer with input_layernorm. '
+            f'Model layer is {type(_first_layer).__name__} (post-norm?). Supporting '
+            f'post-norm architectures (OLMo-2, ...) requires an alternative forward '
+            f'path — tracked as follow-up work.'
+        )
+
     rotary_emb = llama_model.layers[0].self_attn.rotary_emb
     cos_sin_cache = _get_rotary_cos_sin_cache(rotary_emb)
     is_neox = rotary_emb.is_neox_style
@@ -1065,6 +1078,13 @@ def _prefill_independent_contiguous(worker, token_ids, head_dim):
     num_layers = len(kv_caches)
     num_q_heads = llama_model.layers[0].self_attn.num_heads
     n_tokens = len(token_ids)
+
+    _first_layer = llama_model.layers[0]
+    if not hasattr(_first_layer, 'input_layernorm'):
+        raise NotImplementedError(
+            f'_prefill_independent_contiguous requires pre-norm decoder layer. '
+            f'Got {type(_first_layer).__name__} (post-norm?). Not supported yet.'
+        )
 
     fa_version = get_flash_attn_version()
     assert fa_version is not None, "FlashAttention not available"
