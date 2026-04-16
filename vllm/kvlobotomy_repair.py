@@ -517,6 +517,25 @@ def fast_compose_recompute(worker, new_seq_len, block_table,
                 n_kdev = n_repair - n_last
                 kdev_idx = k_dev.topk(n_kdev).indices
                 top_indices = torch.cat([last_idx, kdev_idx]).sort().values
+            elif selection == 'kdev_norm':
+                # K-deviation normalized by stale K norm — hypothesis: raw kdev
+                # picks tokens whose K vectors are naturally large (function
+                # words, punctuation). Relative deviation may be a better signal.
+                stale_k = key_cache[all_physical, all_offsets]
+                num = (k.float() - stale_k.float()).pow(2).sum(dim=[1, 2])
+                denom = stale_k.float().pow(2).sum(dim=[1, 2]).clamp_min(1e-6)
+                k_dev_rel = num / denom
+                top_indices = k_dev_rel.topk(n_repair).indices.sort().values
+            elif selection == 'kdev_cos':
+                # Cosine distance between fresh and stale K — magnitude-invariant.
+                stale_k = key_cache[all_physical, all_offsets]
+                k_flat = k.float().reshape(n_tokens, -1)
+                sk_flat = stale_k.float().reshape(n_tokens, -1)
+                dot = (k_flat * sk_flat).sum(dim=-1)
+                n1 = k_flat.norm(dim=-1).clamp_min(1e-6)
+                n2 = sk_flat.norm(dim=-1).clamp_min(1e-6)
+                cos_sim = dot / (n1 * n2)
+                top_indices = (1 - cos_sim).topk(n_repair).indices.sort().values
             else:
                 raise ValueError(f'unknown selection: {selection}')
             repair_set = set(top_indices.tolist())
