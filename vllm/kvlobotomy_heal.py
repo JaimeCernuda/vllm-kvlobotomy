@@ -243,15 +243,28 @@ def release_surgery_blocks(llm, block_table: list[int]) -> dict:
     """Free surgery-allocated blocks and evict their prefix-cache hashes.
 
     Without this, blocks grabbed via ``get_new_blocks`` in ``extend_block_table``
-    (and any blocks written by ``fast_insert`` / ``fast_replace``) stay allocated
-    and their hashes remain registered via ``heal_prefix_cache_after_replace``.
-    A subsequent ``reset_prefix_cache()`` silently fails (it checks that all
-    blocks are free; any surgery-allocated block fails the check). The next
-    ``llm.chat()`` then hits the stale hash map and reuses the surgery-written
-    blocks as a bogus prefix-cache hit.
+    stay allocated, and ``reset_prefix_cache()`` silently fails (its
+    num_used_blocks==1 invariant is violated). The next ``llm.chat()`` then
+    hits the stale hash map registered by ``heal_prefix_cache_after_replace``
+    and reuses the surgery-written blocks as a bogus prefix-cache hit.
 
     Call this AFTER the evaluation ``llm.chat()`` completes, BEFORE the next
     ``reset_prefix_cache()``.
+
+    **IMPORTANT — pass only the NEWLY ALLOCATED blocks, not the full table.**
+    The blocks that were already owned by a live sequence when you captured
+    ``block_table`` (via ``get_physical_block_table``) are managed by vLLM's
+    sequence lifecycle — those you must NOT touch. Double-freeing them leads
+    to ``AssertionError: block.ref_cnt == 0`` on subsequent allocations.
+
+    Safe pattern in the caller::
+
+        bt = get_physical_block_table(llm, ids_without)
+        base_len = len(bt)                      # owned by the sequence
+        extend_block_table(llm, bt, needed)     # appends new blocks
+        extended_bt = bt[base_len:]             # only the blocks WE allocated
+        # ... surgery + heal + chat ...
+        release_surgery_blocks(llm, extended_bt)
 
     Steps:
       1. Evict the cached hashes for every block in ``block_table`` — removes
@@ -264,7 +277,8 @@ def release_surgery_blocks(llm, block_table: list[int]) -> dict:
 
     Args:
         llm: vLLM LLM instance (offline mode).
-        block_table: list of physical block IDs to release.
+        block_table: list of physical block IDs to release — only blocks
+            you allocated yourself via ``extend_block_table``.
 
     Returns:
         Dict with counts: {'evicted': N, 'freed': M}.
