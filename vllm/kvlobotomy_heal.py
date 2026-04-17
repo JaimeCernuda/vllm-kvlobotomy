@@ -196,6 +196,103 @@ def _find_partial_block(block_pool, known_full_ids: set[int]) -> int | None:
     return None
 
 
+def extend_block_table(llm, block_table: list[int], needed: int) -> list[int]:
+    """Extend block_table to `needed` entries by allocating fresh blocks.
+
+    The prior pattern in experiment scripts was:
+        while len(bt) < needed: mx += 1; bt.append(mx)
+    This appends SEQUENTIAL integer IDs past the current max. Those IDs may
+    collide with live blocks owned by other sequences in the pool, leading
+    to subtle corruption (a subsequent chat() allocates into the same block
+    fast_insert just wrote to).
+
+    This helper pops actual free blocks from block_pool.free_block_queue,
+    guaranteeing the IDs are unused. Safe for INSERT/REPLACE where we need
+    to grow the logical block_table to accommodate B' content.
+
+    Args:
+        llm: vLLM LLM instance (offline mode).
+        block_table: current block_table (may have fewer entries than needed).
+        needed: required total length.
+
+    Returns:
+        Extended block_table list (caller-mutated in place is also fine).
+    """
+    if len(block_table) >= needed:
+        return block_table
+    core = _get_engine_core(llm)
+    block_pool = core.scheduler.kv_cache_manager.block_pool
+    n_add = needed - len(block_table)
+    free = block_pool.get_num_free_blocks()
+    if free < n_add:
+        raise RuntimeError(
+            f"Need {n_add} more blocks but pool has {free} free. "
+            f"Reset prefix cache or reduce sequence length."
+        )
+    new_blocks = block_pool.get_new_blocks(n_add)
+    for b in new_blocks:
+        block_table.append(b.block_id)
+    logger.info(
+        "Extended block_table by %d (now %d) via free-pool allocation",
+        n_add, len(block_table),
+    )
+    return block_table
+
+
+def release_surgery_blocks(llm, block_table: list[int]) -> dict:
+    """Free surgery-allocated blocks and evict their prefix-cache hashes.
+
+    Without this, blocks grabbed via ``get_new_blocks`` in ``extend_block_table``
+    (and any blocks written by ``fast_insert`` / ``fast_replace``) stay allocated
+    and their hashes remain registered via ``heal_prefix_cache_after_replace``.
+    A subsequent ``reset_prefix_cache()`` silently fails (it checks that all
+    blocks are free; any surgery-allocated block fails the check). The next
+    ``llm.chat()`` then hits the stale hash map and reuses the surgery-written
+    blocks as a bogus prefix-cache hit.
+
+    Call this AFTER the evaluation ``llm.chat()`` completes, BEFORE the next
+    ``reset_prefix_cache()``.
+
+    Steps:
+      1. Evict the cached hashes for every block in ``block_table`` — removes
+         those block_hash entries from the hash table.
+      2. Decrement ref_cnt via ``free_blocks`` — returns blocks with ref_cnt=0
+         to the free_block_queue.
+
+    After this, ``reset_prefix_cache()`` sees num_used_blocks == 1 (null block
+    only) and actually resets.
+
+    Args:
+        llm: vLLM LLM instance (offline mode).
+        block_table: list of physical block IDs to release.
+
+    Returns:
+        Dict with counts: {'evicted': N, 'freed': M}.
+    """
+    core = _get_engine_core(llm)
+    block_pool = core.scheduler.kv_cache_manager.block_pool
+    all_blocks = block_pool.blocks
+
+    unique_ids = list(dict.fromkeys(block_table))  # preserve order, dedupe
+    # Phase 1: evict from cache hash table. This removes block_hash entries
+    # so subsequent lookups miss. evict_blocks only drops cached blocks;
+    # blocks with ref_cnt > 0 remain allocated until we free them below.
+    block_pool.evict_blocks(set(unique_ids))
+
+    # Phase 2: decrement ref_cnt and return to free queue when ref_cnt == 0.
+    # The block objects in block_pool.blocks are indexed by block_id.
+    blocks_to_free = []
+    for bid in unique_ids:
+        if bid == 0:  # null block
+            continue
+        if 0 <= bid < len(all_blocks):
+            blocks_to_free.append(all_blocks[bid])
+    block_pool.free_blocks(blocks_to_free)
+
+    logger.info("Released %d surgery blocks (evicted + freed)", len(blocks_to_free))
+    return {'evicted': len(unique_ids), 'freed': len(blocks_to_free)}
+
+
 def heal_prefix_cache_after_delete(
     llm,
     abc_token_ids: list[int],
@@ -333,6 +430,148 @@ def heal_prefix_cache_after_delete(
         first_changed,
         len(old_hashes),
         len(new_hashes),
+    )
+
+    return result
+
+
+def heal_prefix_cache_after_replace(
+    llm,
+    old_token_ids: list[int],
+    new_token_ids: list[int],
+    block_table: list[int],
+) -> dict:
+    """Heal prefix cache hash table after in-place REPLACE/INSERT.
+
+    After ``fast_replace`` / ``fast_insert`` patches the physical K/V blocks
+    so they contain ``new_token_ids`` content, vLLM's prefix-cache hash table
+    still indexes the OLD block hashes. A subsequent ``llm.chat(new_msgs)``
+    will hash ``new_token_ids``, miss the table, and RE-PREFILL from the
+    first divergence point — discarding the surgical patch entirely.
+
+    This function unregisters the old hashes from the divergence point
+    onward and re-registers new-sequence hashes against the physical blocks
+    pointed to by ``block_table``. Subsequent queries with ``new_token_ids``
+    then get a prefix-cache HIT and use the surgically patched data.
+
+    Handles both REPLACE (same or different B' length) and INSERT (longer
+    new sequence). For INSERT, the caller must have extended ``block_table``
+    to cover the new length BEFORE calling the surgical op, and the op must
+    have written content for the new positions.
+
+    Args:
+        llm: vLLM LLM instance (offline mode).
+        old_token_ids: token_ids that populated the cache (e.g. wrong_msgs
+            for REPLACE, or [A,C] for INSERT).
+        new_token_ids: token_ids the cache now physically represents after
+            the surgical op (e.g. correct_msgs for REPLACE, [A,B',C] for
+            INSERT).
+        block_table: physical block IDs covering the NEW sequence length.
+
+    Returns:
+        Dict with heal metadata: blocks_removed, blocks_registered,
+        first_changed, old_blocks, new_blocks.
+    """
+    core = _get_engine_core(llm)
+    block_pool = core.scheduler.kv_cache_manager.block_pool
+    block_size = block_pool.hash_block_size
+    hash_fn = core.caching_hash_fn
+
+    if hash_fn is None:
+        raise RuntimeError(
+            "Prefix caching hash function not available. "
+            "Is enable_prefix_caching=True?"
+        )
+
+    old_hashes = _compute_block_hashes(old_token_ids, block_size, hash_fn)
+    new_hashes = _compute_block_hashes(new_token_ids, block_size, hash_fn)
+
+    # Find first block where hashes diverge.
+    first_changed = min(len(old_hashes), len(new_hashes))
+    for i in range(first_changed):
+        if old_hashes[i] != new_hashes[i]:
+            first_changed = i
+            break
+
+    coordinator = core.scheduler.kv_cache_manager.coordinator
+    group_ids = [
+        mgr.kv_cache_group_id for mgr in coordinator.single_type_managers
+    ]
+
+    blocks_removed = 0
+    blocks_registered = 0
+
+    # block_pool.blocks is a list[KVCacheBlock] indexed by block_id.
+    all_blocks = block_pool.blocks
+    assert len(block_table) >= len(new_hashes), (
+        f"block_table has {len(block_table)} physical blocks but new sequence "
+        f"needs at least {len(new_hashes)} full blocks "
+        f"({len(new_token_ids)} tokens / {block_size})."
+    )
+
+    for group_id in group_ids:
+        # Phase 1: unregister old hashes from first_changed onward.
+        # Also clear block.block_hash on every referenced block so that
+        # Phase 2's setter assertion (must be None) doesn't fire.
+        for i in range(first_changed, len(old_hashes)):
+            hash_with_group = make_block_hash_with_group_id(
+                old_hashes[i], group_id
+            )
+            block = block_pool.cached_block_hash_to_block.get_one_block(
+                hash_with_group
+            )
+            if block is not None:
+                block_pool.cached_block_hash_to_block.pop(
+                    hash_with_group, block.block_id
+                )
+                block.reset_hash()
+                blocks_removed += 1
+
+        # Phase 2: register new hashes at the physical blocks holding new
+        # data. Some of these blocks may not have been in Phase 1 (e.g.
+        # newly allocated tail blocks for an INSERT that extended the
+        # sequence); they may already carry a hash from a prior allocation,
+        # so clear it first.
+        for j in range(first_changed, len(new_hashes)):
+            physical_block_id = block_table[j]
+            if physical_block_id >= len(all_blocks):
+                logger.warning(
+                    "block_table[%d]=%d out of range (pool has %d blocks)",
+                    j, physical_block_id, len(all_blocks),
+                )
+                continue
+            block = all_blocks[physical_block_id]
+            if block.block_hash is not None:
+                # Unregister the lingering mapping, too, so no stale lookup.
+                try:
+                    block_pool.cached_block_hash_to_block.pop(
+                        block.block_hash, block.block_id
+                    )
+                except Exception:
+                    pass
+                block.reset_hash()
+            hash_with_group = make_block_hash_with_group_id(
+                new_hashes[j], group_id
+            )
+            block.block_hash = hash_with_group
+            block_pool.cached_block_hash_to_block.insert(
+                hash_with_group, block
+            )
+            blocks_registered += 1
+
+    result = {
+        "blocks_removed": blocks_removed,
+        "blocks_registered": blocks_registered,
+        "first_changed": first_changed,
+        "old_blocks": len(old_hashes),
+        "new_blocks": len(new_hashes),
+    }
+
+    logger.info(
+        "Hash table healed (replace/insert): removed=%d, registered=%d "
+        "(first_changed=%d, old=%d blocks, new=%d blocks)",
+        blocks_removed, blocks_registered, first_changed,
+        len(old_hashes), len(new_hashes),
     )
 
     return result

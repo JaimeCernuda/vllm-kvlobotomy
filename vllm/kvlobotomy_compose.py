@@ -236,13 +236,21 @@ def _prefill_b_prime(worker, b_prime_token_ids, insert_pos, a_len,
     num_q_heads = llama_model.layers[0].self_attn.num_heads
 
     # Detect pre-norm (LLaMA-style) vs post-norm (OLMo-2-style) architectures.
-    # Pre-norm: input_layernorm -> qkv_proj -> attention -> o_proj -> residual +
-    #           post_attention_layernorm -> mlp -> residual +.
-    # Post-norm: qkv_proj -> attention -> o_proj -> post_attention_layernorm ->
-    #            residual + -> mlp -> post_feedforward_layernorm -> residual +.
     _first_layer = llama_model.layers[0]
     _is_post_norm = (not hasattr(_first_layer, 'input_layernorm')
                      and hasattr(_first_layer, 'post_feedforward_layernorm'))
+    _is_gemma_style = (hasattr(_first_layer, 'input_layernorm')
+                       and hasattr(_first_layer, 'pre_feedforward_layernorm'))
+
+    # Granite-family multipliers. Defaults are no-ops for LLaMA/Mistral/etc.
+    _cfg = getattr(model_obj, 'config', None) or getattr(worker.model_runner, 'model_config', None)
+    _hf_cfg = _cfg.hf_config if hasattr(_cfg, 'hf_config') else _cfg
+    _embed_mult = float(getattr(_hf_cfg, 'embedding_multiplier', 1.0) or 1.0)
+    _residual_mult = float(getattr(_hf_cfg, 'residual_multiplier', 1.0) or 1.0)
+    _attn_mult = getattr(_hf_cfg, 'attention_multiplier', None)
+    _attn_softcap = float(getattr(_hf_cfg, 'attn_logit_softcapping', 0.0) or 0.0)
+    _is_granite_style = _residual_mult != 1.0
+    _gemma_normalizer = (float(_hf_cfg.hidden_size) ** 0.5) if _is_gemma_style else 1.0
 
     rotary_emb = llama_model.layers[0].self_attn.rotary_emb
     cos_sin_cache = _get_rotary_cos_sin_cache(rotary_emb)
@@ -256,6 +264,10 @@ def _prefill_b_prime(worker, b_prime_token_ids, insert_pos, a_len,
     # Token IDs -> embeddings
     token_ids_t = torch.tensor(b_prime_token_ids, device=device, dtype=torch.long)
     hidden_states = llama_model.embed_tokens(token_ids_t)  # [B', hidden_size]
+    if _embed_mult != 1.0:
+        hidden_states = hidden_states * _embed_mult
+    if _gemma_normalizer != 1.0:
+        hidden_states = hidden_states * _gemma_normalizer
 
     # B' positions in the final sequence: [insert_pos, insert_pos + b_prime_len)
     b_prime_positions = torch.arange(
@@ -282,7 +294,7 @@ def _prefill_b_prime(worker, b_prime_token_ids, insert_pos, a_len,
     ctx_blocks = bt_t[ctx_logical]
 
     gqa_ratio = num_q_heads // num_kv_heads
-    scale = head_dim ** -0.5
+    scale = float(_attn_mult) if _attn_mult is not None else head_dim ** -0.5
 
     residual = None
 
@@ -291,12 +303,20 @@ def _prefill_b_prime(worker, b_prime_token_ids, insert_pos, a_len,
         key_cache = kv_caches[layer_idx][0]
         val_cache = kv_caches[layer_idx][1]
 
-        # Pre-attention layernorm (pre-norm only). For post-norm, the
-        # attention block is computed from the raw residual stream and the
-        # layernorm is applied AFTER attention.
+        # Pre-attention layernorm dispatch.
         if _is_post_norm:
             residual_pre_attn = hidden_states
             attn_input = hidden_states
+        elif _is_gemma_style:
+            if residual is None:
+                residual = hidden_states
+                attn_input = layer.input_layernorm(hidden_states)
+            else:
+                attn_input, residual = layer.input_layernorm(
+                    hidden_states, residual)
+        elif _is_granite_style:
+            residual = hidden_states
+            attn_input = layer.input_layernorm(hidden_states)
         else:
             if residual is None:
                 residual = hidden_states
@@ -350,6 +370,10 @@ def _prefill_b_prime(worker, b_prime_token_ids, insert_pos, a_len,
                     k_h.unsqueeze(0).expand(chunk_len, -1, -1).transpose(1, 2),
                 ) * scale  # [chunk, gqa_ratio, context_len]
 
+                # Gemma-2 attention logit softcap (applied pre-softmax).
+                if _attn_softcap > 0:
+                    scores = torch.tanh(scores / _attn_softcap) * _attn_softcap
+
                 # Causal mask: B' token at position p can only attend to positions <= p
                 for i in range(chunk_len):
                     pos = b_prime_positions[cs + i]
@@ -379,10 +403,21 @@ def _prefill_b_prime(worker, b_prime_token_ids, insert_pos, a_len,
             mlp_out = layer.mlp(hidden_states)
             mlp_normed = layer.post_feedforward_layernorm(mlp_out)
             hidden_states = residual_pre_mlp + mlp_normed
+        elif _is_gemma_style:
+            post_attn = layer.post_attention_layernorm(attn_proj)
+            hidden_states, residual = layer.pre_feedforward_layernorm(
+                post_attn, residual)
+            mlp_out = layer.mlp(hidden_states)
+            hidden_states = layer.post_feedforward_layernorm(mlp_out)
+        elif _is_granite_style:
+            # Granite: non-fused RMSNorm + residual*multiplier
+            hidden_states = residual + attn_proj * _residual_mult
+            residual = hidden_states
+            hidden_states = layer.post_attention_layernorm(hidden_states)
+            mlp_out = layer.mlp(hidden_states)
+            hidden_states = residual + mlp_out * _residual_mult
         else:
             hidden_states = attn_proj
-            # Pre-norm: layer.post_attention_layernorm updates residual and
-            # normalizes hidden_states in one call
             hidden_states, residual = layer.post_attention_layernorm(
                 hidden_states, residual)
             hidden_states = layer.mlp(hidden_states)
@@ -945,7 +980,8 @@ def extract_segment_kv(worker, token_ids, start_pos, end_pos, block_table):
 
 def fast_insert_v1(worker, ac_seq_len, block_table, b_prime_token_ids,
                    insert_pos, head_dim, rope_theta, num_kv_heads,
-                   abc_token_ids=None, repair_ratio=0.05):
+                   abc_token_ids=None, repair_ratio=0.05,
+                   repair_attn_mode='decode'):
     """Insert B' seeing A context. C extracted and rewritten.
 
     Path 1: B' prefilled via paged FlashAttention reading A's KV from cache.
@@ -1053,6 +1089,7 @@ def fast_insert_v1(worker, ac_seq_len, block_table, b_prime_token_ids,
             head_dim=head_dim,
             delete_start=insert_pos,
             ac_token_ids=list(abc_token_ids),
+            _attn_mode=repair_attn_mode,
         )
     torch.cuda.synchronize()
     timings['repair_ms'] = round((time.perf_counter() - t_repair) * 1000, 1)
@@ -1107,14 +1144,30 @@ def _prefill_independent_contiguous(worker, token_ids, head_dim):
     _first_layer = llama_model.layers[0]
     _is_post_norm = (not hasattr(_first_layer, 'input_layernorm')
                      and hasattr(_first_layer, 'post_feedforward_layernorm'))
+    _is_gemma_style = (hasattr(_first_layer, 'input_layernorm')
+                       and hasattr(_first_layer, 'pre_feedforward_layernorm'))
+
+    # Granite-family multipliers (no-op for LLaMA/Mistral/etc).
+    _cfg = getattr(model_runner.model, 'config', None) or getattr(model_runner, 'model_config', None)
+    _hf_cfg = _cfg.hf_config if hasattr(_cfg, 'hf_config') else _cfg
+    _embed_mult = float(getattr(_hf_cfg, 'embedding_multiplier', 1.0) or 1.0)
+    _residual_mult = float(getattr(_hf_cfg, 'residual_multiplier', 1.0) or 1.0)
+    _attn_mult = getattr(_hf_cfg, 'attention_multiplier', None)
+    _attn_softcap = float(getattr(_hf_cfg, 'attn_logit_softcapping', 0.0) or 0.0)
+    _is_granite_style = _residual_mult != 1.0
+    _gemma_normalizer = (float(_hf_cfg.hidden_size) ** 0.5) if _is_gemma_style else 1.0
 
     fa_version = get_flash_attn_version()
     assert fa_version is not None, "FlashAttention not available"
-    scale = head_dim ** -0.5
+    scale = float(_attn_mult) if _attn_mult is not None else head_dim ** -0.5
 
     # Token embeddings
     ids_t = torch.tensor(token_ids, device=device, dtype=torch.long)
     hidden_states = llama_model.embed_tokens(ids_t)
+    if _embed_mult != 1.0:
+        hidden_states = hidden_states * _embed_mult
+    if _gemma_normalizer != 1.0:
+        hidden_states = hidden_states * _gemma_normalizer
 
     # Positions [0, n_tokens) — independent, no external context
     positions = torch.arange(n_tokens, device=device, dtype=torch.long)
@@ -1131,9 +1184,23 @@ def _prefill_independent_contiguous(worker, token_ids, head_dim):
     for layer_idx in range(num_layers):
         layer = llama_model.layers[layer_idx]
 
+        # Gemma-2 alternating sliding/full attention per layer.
+        _layer_sw = getattr(getattr(layer.self_attn, 'attn', None), 'sliding_window', None)
+        _window_size = [_layer_sw - 1, 0] if (_layer_sw and _layer_sw > 0) else None
+
         if _is_post_norm:
             residual_pre_attn = hidden_states
             attn_input = hidden_states
+        elif _is_gemma_style:
+            if residual is None:
+                residual = hidden_states
+                attn_input = layer.input_layernorm(hidden_states)
+            else:
+                attn_input, residual = layer.input_layernorm(
+                    hidden_states, residual)
+        elif _is_granite_style:
+            residual = hidden_states
+            attn_input = layer.input_layernorm(hidden_states)
         else:
             if residual is None:
                 residual = hidden_states
@@ -1179,6 +1246,8 @@ def _prefill_independent_contiguous(worker, token_ids, head_dim):
             softmax_scale=scale,
             causal=True,
             fa_version=fa_version,
+            softcap=_attn_softcap,
+            window_size=_window_size,
         )
 
         # Output projection
@@ -1192,6 +1261,18 @@ def _prefill_independent_contiguous(worker, token_ids, head_dim):
             mlp_out = layer.mlp(hidden_states)
             mlp_normed = layer.post_feedforward_layernorm(mlp_out)
             hidden_states = residual_pre_mlp + mlp_normed
+        elif _is_gemma_style:
+            post_attn = layer.post_attention_layernorm(attn_proj)
+            hidden_states, residual = layer.pre_feedforward_layernorm(
+                post_attn, residual)
+            mlp_out = layer.mlp(hidden_states)
+            hidden_states = layer.post_feedforward_layernorm(mlp_out)
+        elif _is_granite_style:
+            hidden_states = residual + attn_proj * _residual_mult
+            residual = hidden_states
+            hidden_states = layer.post_attention_layernorm(hidden_states)
+            mlp_out = layer.mlp(hidden_states)
+            hidden_states = residual + mlp_out * _residual_mult
         else:
             hidden_states = attn_proj
             hidden_states, residual = layer.post_attention_layernorm(
@@ -1203,7 +1284,10 @@ def _prefill_independent_contiguous(worker, token_ids, head_dim):
 
 def fast_insert(worker, ac_seq_len, block_table, b_prime_token_ids,
                 insert_pos, head_dim, rope_theta, num_kv_heads,
-                abc_token_ids=None, repair_ratio=0.15):
+                abc_token_ids=None, repair_ratio=0.15,
+                repair_attn_mode='decode',
+                c_selector='tail', c_pin_last=0,
+                c_source_start=None, c_source_rope_start=None):
     """Insert B' into [A,C] → [A,B',C] via independent prefill (Path 2).
 
     Memory-efficient: no temporary C extraction buffer.
@@ -1254,6 +1338,14 @@ def fast_insert(worker, ac_seq_len, block_table, b_prime_token_ids,
     c_len = ac_seq_len - insert_pos
     final_seq_len = insert_pos + b_prime_len + c_len
 
+    # For INSERT: C currently sits at [insert_pos, insert_pos+c_len) with its K
+    # rotated at those same positions — defaults. For REPLACE, the caller (fast_
+    # replace) passes c_source_start=delete_end because C was prefilled
+    # contiguous with wrong_B, so it lives at [delete_end, delete_end+c_len)
+    # with K rotated at those positions.
+    if c_source_start is None: c_source_start = insert_pos
+    if c_source_rope_start is None: c_source_rope_start = c_source_start
+
     bt_t = torch.tensor(block_table, device=device, dtype=torch.long)
 
     final_blocks_needed = (final_seq_len + block_size - 1) // block_size
@@ -1293,20 +1385,30 @@ def fast_insert(worker, ac_seq_len, block_table, b_prime_token_ids,
     t_shift = time.perf_counter()
 
     if c_len > 0 and b_prime_len > 0:
-        c_old = torch.arange(
-            insert_pos + c_len - 1, insert_pos - 1, -1,
-            device=device, dtype=torch.long)
-        c_new = c_old + b_prime_len
+        c_new_start = insert_pos + b_prime_len
+        # Determine iteration direction. Rightward shifts (dst > src) must go
+        # reverse to avoid overwriting src before read. Leftward or equal use
+        # forward. (Using torch vectorised reads-all-then-writes-all semantics,
+        # the direction only matters when src/dst ranges overlap in the same
+        # physical block+offset, which is safer to handle explicitly.)
+        if c_new_start >= c_source_start:
+            c_src = torch.arange(c_source_start + c_len - 1,
+                                 c_source_start - 1, -1,
+                                 device=device, dtype=torch.long)
+        else:
+            c_src = torch.arange(c_source_start, c_source_start + c_len,
+                                 device=device, dtype=torch.long)
+        c_dst = c_src + (c_new_start - c_source_start)
 
-        old_blk = bt_t[c_old // block_size]
-        old_off = c_old % block_size
-        new_blk = bt_t[c_new // block_size]
-        new_off = c_new % block_size
+        src_blk = bt_t[c_src // block_size]
+        src_off = c_src % block_size
+        dst_blk = bt_t[c_dst // block_size]
+        dst_off = c_dst % block_size
 
         for li in range(num_layers):
             kv = kv_caches[li]
-            kv[0][new_blk, new_off] = kv[0][old_blk, old_off]
-            kv[1][new_blk, new_off] = kv[1][old_blk, old_off]
+            kv[0][dst_blk, dst_off] = kv[0][src_blk, src_off]
+            kv[1][dst_blk, dst_off] = kv[1][src_blk, src_off]
 
     torch.cuda.synchronize()
     timings['shift_ms'] = round((time.perf_counter() - t_shift) * 1000, 1)
@@ -1345,17 +1447,24 @@ def fast_insert(worker, ac_seq_len, block_table, b_prime_token_ids,
         kv_caches[li][0][b_blk, b_off] = _rope_correct_keys_via_cache(
             k, b_old_pos, b_new_pos, cos_sin_cache, is_neox)
 
-    # C RoPE: undo pos [insert_pos..+C), redo pos [insert_pos+B'..final)
+    # C RoPE: K was rotated at [c_source_rope_start, c_source_rope_start+c_len)
+    # in its pre-shift state. After step 2 the data is at
+    # [insert_pos+b_prime_len, final_seq_len). Undo old pos, redo new pos.
+    # Skip if the shift is a no-op (REPLACE delta=0 case where C didn't move).
     if c_len > 0:
         c_old_pos = torch.arange(
-            insert_pos, insert_pos + c_len, device=device, dtype=torch.long)
-        c_new_pos = c_old_pos + b_prime_len
-        c_blk = bt_t[c_new_pos // block_size]
-        c_off = c_new_pos % block_size
-        for li in range(num_layers):
-            k = kv_caches[li][0][c_blk, c_off]
-            kv_caches[li][0][c_blk, c_off] = _rope_correct_keys_via_cache(
-                k, c_old_pos, c_new_pos, cos_sin_cache, is_neox)
+            c_source_rope_start, c_source_rope_start + c_len,
+            device=device, dtype=torch.long)
+        c_new_pos = torch.arange(
+            insert_pos + b_prime_len, insert_pos + b_prime_len + c_len,
+            device=device, dtype=torch.long)
+        if not torch.equal(c_old_pos, c_new_pos):
+            c_blk = bt_t[c_new_pos // block_size]
+            c_off = c_new_pos % block_size
+            for li in range(num_layers):
+                k = kv_caches[li][0][c_blk, c_off]
+                kv_caches[li][0][c_blk, c_off] = _rope_correct_keys_via_cache(
+                    k, c_old_pos, c_new_pos, cos_sin_cache, is_neox)
 
     torch.cuda.synchronize()
     timings['rope_ms'] = round((time.perf_counter() - t_rope) * 1000, 1)
@@ -1371,25 +1480,106 @@ def fast_insert(worker, ac_seq_len, block_table, b_prime_token_ids,
 
     num_repaired = 0
     if repair_ratio > 0 and abc_token_ids is not None:
-        from vllm.kvlobotomy_repair import fast_selective_recompute
+        from vllm.kvlobotomy_repair import (
+            fast_selective_recompute,
+            diagnose_attention_to_b,
+            select_repair_candidates,
+        )
 
-        # All B' tokens need repair (saw no A context)
+        # All B' tokens need repair (saw no A context during independent prefill)
         b_repair = list(range(b_prime_len))
-        # Top repair_ratio of C tokens
-        c_repair_n = max(1, int(c_len * repair_ratio))
-        c_repair = list(range(b_prime_len, b_prime_len + c_repair_n))
+
+        # C-selector options:
+        #   'tail' (default): last c_ratio tokens of C. Exact bottom-right mask
+        #     in prefill FA; covers generation region (CacheBlend suffix-pin).
+        #     REMOVE experiment proved tail beats boundary 97%/64% on
+        #     generation-at-tail tasks.
+        #   'vdev': V-deviation scattered top-k. Picks the tokens most
+        #     changed by the B→B' swap. Needed when answer-carrying content
+        #     is in C-middle (multi-hop QA), not tail.
+        #   'boundary': first c_ratio tokens of C. Known-bad on
+        #     generation-at-tail; exposed here only for ablations.
+        #   'none' or ratio=0: skip C repair, repair only B'.
+        c_repair_n = max(1, int(c_len * repair_ratio)) if c_len > 0 else 0
+        if c_repair_n == 0:
+            c_repair = []
+        elif c_selector == 'tail':
+            c_repair = list(range(
+                b_prime_len + c_len - c_repair_n,
+                b_prime_len + c_len,
+            ))
+        elif c_selector == 'boundary':
+            c_repair = list(range(
+                b_prime_len,
+                b_prime_len + c_repair_n,
+            ))
+        elif c_selector == 'vdev':
+            # V-dev needs a diagnostic pass over C vs its stale counterpart.
+            # We run diagnose_attention_to_b with delete_start=insert_pos and
+            # delete_end=insert_pos+b_prime_len, treating B' as "the region
+            # to diagnose against" — V_diff then highlights C tokens whose
+            # V values moved most between stale (wrong_B context) and current
+            # (B' context). Call ALWAYS requires worker, so caller provides it.
+            diag = diagnose_attention_to_b(
+                worker, final_seq_len, insert_pos,
+                insert_pos + b_prime_len, block_table,
+            )
+            c_picks = select_repair_candidates(diag, ratio=repair_ratio)
+            # c_picks are relative to C (c_picks in [0, c_len)); shift by
+            # b_prime_len to put them in the all_repair index space
+            # (delete_start=insert_pos, so repair indices are relative to
+            # B'+C). Optionally pin last c_pin_last tokens of C.
+            pick_set = set(p + b_prime_len for p in c_picks)
+            if c_pin_last > 0:
+                for j in range(max(0, c_len - c_pin_last), c_len):
+                    pick_set.add(b_prime_len + j)
+            c_repair = sorted(pick_set)
+        elif c_selector == 'none':
+            c_repair = []
+        else:
+            raise ValueError(f'unknown c_selector: {c_selector}')
+
         all_repair = b_repair + c_repair
         num_repaired = len(all_repair)
 
-        fast_selective_recompute(
-            worker=worker,
-            new_seq_len=final_seq_len,
-            block_table=block_table,
-            repair_indices=all_repair,
-            head_dim=head_dim,
-            delete_start=insert_pos,  # B'+C start at insert_pos
-            ac_token_ids=list(abc_token_ids),
-        )
+        # Two-call FA refactor: when c_selector='tail' (or no c_repair), split
+        # repair into (1) B' tokens scoped to A+B' and (2) C-tail tokens scoped
+        # to full sequence. Both calls use prefill-mode FA (packed bottom-right
+        # mask) because queries ARE at the tail of their respective scopes.
+        # This avoids the decode-mode cost (9× slower per measurement) without
+        # sacrificing correctness. For vdev/boundary selectors (scattered in C),
+        # fall back to single-call decode mode where per-query masks are exact.
+        # Always split B' repair from C repair so B' gets the fast prefill path
+        # (B' IS the tail of A+B', so bottom-right mask is exact).
+        # C repair path depends on selector:
+        #   - tail/none → prefill mode (C-tail is at sequence end)
+        #   - vdev/boundary scattered → caller's attn_mode (default 'decode')
+        if b_prime_len > 0 and b_repair:
+            fast_selective_recompute(
+                worker=worker,
+                new_seq_len=insert_pos + b_prime_len,
+                block_table=block_table,
+                repair_indices=b_repair,
+                head_dim=head_dim,
+                delete_start=insert_pos,
+                ac_token_ids=list(abc_token_ids),
+                _attn_mode='prefill',
+            )
+        if c_repair:
+            if c_selector in ('tail', 'none') and repair_attn_mode == 'decode':
+                _c_mode = 'prefill'
+            else:
+                _c_mode = repair_attn_mode
+            fast_selective_recompute(
+                worker=worker,
+                new_seq_len=final_seq_len,
+                block_table=block_table,
+                repair_indices=c_repair,
+                head_dim=head_dim,
+                delete_start=insert_pos,
+                ac_token_ids=list(abc_token_ids),
+                _attn_mode=_c_mode,
+            )
 
     torch.cuda.synchronize()
     timings['repair_ms'] = round((time.perf_counter() - t_repair) * 1000, 1)
@@ -1408,7 +1598,9 @@ def fast_insert(worker, ac_seq_len, block_table, b_prime_token_ids,
 
 def fast_replace(worker, total_seq_len, block_table, b_prime_token_ids,
                  delete_start, delete_end, head_dim, rope_theta,
-                 num_kv_heads, abc_token_ids=None, repair_ratio=0.15):
+                 num_kv_heads, abc_token_ids=None, repair_ratio=0.15,
+                 repair_attn_mode='decode',
+                 c_selector='tail', c_pin_last=0):
     """Replace B with B' in [A,B,C] via independent B' prefill (Path 2).
 
     Memory-efficient: no C extraction buffer.
@@ -1435,13 +1627,22 @@ def fast_replace(worker, total_seq_len, block_table, b_prime_token_ids,
     Returns:
         dict with per-step timing breakdown
     """
-    # REPLACE = shift C to make room + independent B' prefill + repair
-    # Delegates to fast_insert after shifting C and adjusting parameters.
+    # REPLACE via fast_insert with c_source_start=delete_end.
+    # The cache currently holds [A, wrong_B, C] contiguously, so C lives at
+    # [delete_end, delete_end+c_len) with K rotated at those same positions.
+    # We tell fast_insert to read C from that source location instead of the
+    # default [insert_pos, insert_pos+c_len) (which would be wrong_B's slot).
+    # fast_insert then:
+    #   (a) shifts C from [delete_end, ...) to [a_len+b_prime_len, ...)
+    #   (b) writes B' K/V into [a_len, a_len+b_prime_len)
+    #   (c) RoPE-corrects C from original positions to final positions
+    # This replaces the previous double-shift bug (fast_replace pre-shifted
+    # then fast_insert re-shifted reading garbage).
     a_len = delete_start
     old_b_len = delete_end - delete_start
     c_len = total_seq_len - delete_end
     b_prime_len = len(b_prime_token_ids)
-    ac_seq_len = a_len + c_len  # what it would be after B removed
+    ac_seq_len = a_len + c_len
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -1454,50 +1655,8 @@ def fast_replace(worker, total_seq_len, block_table, b_prime_token_ids,
     bt_t = torch.tensor(block_table, device=device, dtype=torch.long)
 
     final_seq_len = a_len + b_prime_len + c_len
-    final_blocks = (final_seq_len + block_size - 1) // block_size
-    assert len(block_table) >= final_blocks, (
-        f"Block table has {len(block_table)} blocks but need "
-        f"{final_blocks} for {final_seq_len} tokens"
-    )
+    delta = b_prime_len - old_b_len
 
-    # Step 1: Shift C from [delete_end, ...) to [a_len + b_prime_len, ...)
-    # If B' > B, shift right (reverse order). If B' < B, shift left (forward order).
-    torch.cuda.synchronize()
-    t_shift = time.perf_counter()
-
-    delta = b_prime_len - old_b_len  # positive = rightward shift
-    if c_len > 0 and delta != 0:
-        if delta > 0:
-            # Rightward: iterate reverse to avoid overwrite
-            c_range = torch.arange(
-                delete_end + c_len - 1, delete_end - 1, -1,
-                device=device, dtype=torch.long,
-            )
-        else:
-            # Leftward: iterate forward
-            c_range = torch.arange(
-                delete_end, delete_end + c_len,
-                device=device, dtype=torch.long,
-            )
-        c_new_range = c_range + delta
-
-        old_log = c_range // block_size
-        old_off = c_range % block_size
-        old_blk = bt_t[old_log]
-        new_log = c_new_range // block_size
-        new_off = c_new_range % block_size
-        new_blk = bt_t[new_log]
-
-        for layer_idx in range(num_layers):
-            kv = kv_caches[layer_idx]
-            kv[0][new_blk, new_off] = kv[0][old_blk, old_off]
-            kv[1][new_blk, new_off] = kv[1][old_blk, old_off]
-
-    torch.cuda.synchronize()
-    shift_ms = (time.perf_counter() - t_shift) * 1000
-
-    # Now cache layout is [A, (gap of b_prime_len), C_shifted]
-    # Delegate to fast_insert for B' prefill + RoPE + repair
     result = fast_insert(
         worker=worker,
         ac_seq_len=ac_seq_len,
@@ -1509,9 +1668,14 @@ def fast_replace(worker, total_seq_len, block_table, b_prime_token_ids,
         num_kv_heads=num_kv_heads,
         abc_token_ids=abc_token_ids,
         repair_ratio=repair_ratio,
+        repair_attn_mode=repair_attn_mode,
+        c_selector=c_selector,
+        c_pin_last=c_pin_last,
+        c_source_start=delete_end,          # C sits after wrong_B
+        c_source_rope_start=delete_end,     # and K was rotated there
     )
 
-    # Zero stale tail if sequence got shorter
+    # Zero stale tail if final sequence got shorter (old_b_len > b_prime_len)
     if final_seq_len < total_seq_len:
         stale = torch.arange(final_seq_len, total_seq_len,
                              device=device, dtype=torch.long)
@@ -1524,7 +1688,6 @@ def fast_replace(worker, total_seq_len, block_table, b_prime_token_ids,
             kv[1][s_blk, s_off] = 0
 
     total_ms = (time.perf_counter() - t0) * 1000
-    result['shift_ms'] = round(shift_ms, 1)
     result['total_ms'] = round(total_ms, 1)
     result['old_b_len'] = old_b_len
     result['size_delta'] = delta
